@@ -20,7 +20,6 @@ class MyBot(commands.Bot):
             application_id = config.clientID
         )
 
-
     # Setup hook
     async def setup_hook(self):
         await load_cogs()
