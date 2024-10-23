@@ -13,7 +13,7 @@ from discord import app_commands
 class MyBot(commands.Bot):
     #Init
     def __init__(self):
-        myIntents = discord.Intents.default()
+        myIntents = discord.Intents.all()
         super().__init__(
             command_prefix = "!",
             intents = myIntents,
@@ -23,6 +23,7 @@ class MyBot(commands.Bot):
     # Setup hook
     async def setup_hook(self):
         await load_cogs()
+        await bot.tree.sync(guild = config.myGuild)
 
 
     # On ready

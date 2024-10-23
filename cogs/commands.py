@@ -18,30 +18,33 @@ class Commands(commands.Cog):
         self.bot = bot
 
         # Init Fantrax api instance
-        self.api = FantraxAPI()
+        self.api = FantraxAPI(config.leagueId)
 
 
     # Commands 
     # Magic Conch Filler Command
-    @app_commands.command(name='conch', description='Ask the Magic Conch for an answer.')
-    async def conch(self, interaction: discord.Interaction, question: str) -> None:
+    @app_commands.command(name='askshams', description='Ask Shams a question and he will provide his wisdom.')
+    async def askShams(self, interaction: discord.Interaction, question: str) -> None:
         rand = random.randint(0,17)
-    
-        responses = config.responses
-
-        # Send Embed with Reply
-        imgURL = "https://i.imgur.com/RLsojmN.jpg"
+        imgURL = "https://i.imgur.com/ZC44rDY.jpeg"
         embed=discord.Embed(color=0xf1d3ed)
         embed.set_image( url = imgURL )
-        embed.add_field(name="Magic Conch", value=question, inline=False)
-        embed.add_field(name=responses[rand], value='\u200b', inline=False)
+        embed.add_field(name="You have asked Shams-kun:", value=question, inline=False)
+        embed.add_field(name=config.conchResponses[rand], value='\u200b', inline=False)
         await interaction.response.send_message(embed=embed)
 
 
-    @app_commands.command(name='standings',description='Display Current Standings')
+    @app_commands.command(name='scoreboard', description='Display Current Scoreboard')
+    async def scoreboard(self, interaction: discord.Integration) -> None:
+        await interaction.response.send_message(self.api.scoring_periods()[1])
+
+
+    @app_commands.command(name='standings', description='Display Current Standings')
     async def standings(self, interaction: discord.Interaction) -> None:
+        print(self.api.standings)
+        await interaction.response.send_message(self.api.scoring_periods)
         return
 
 
 async def setup(bot):
-    await bot.add_cog(Commands(bot))
+    await bot.add_cog(Commands(bot), guilds=[config.myGuild])
