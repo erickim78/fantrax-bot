@@ -34,17 +34,5 @@ class Commands(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
 
-    @app_commands.command(name='scoreboard', description='Display Current Scoreboard')
-    async def scoreboard(self, interaction: discord.Integration) -> None:
-        await interaction.response.send_message(self.api.scoring_periods()[1])
-
-
-    @app_commands.command(name='standings', description='Display Current Standings')
-    async def standings(self, interaction: discord.Interaction) -> None:
-        print(self.api.standings)
-        await interaction.response.send_message(self.api.scoring_periods)
-        return
-
-
 async def setup(bot):
     await bot.add_cog(Commands(bot), guilds=[config.myGuild])

@@ -219,12 +219,13 @@ class TransactionTracker(commands.Cog):
         self._save_posted_ids()
 
     # ── background loops ──────────────────────────────────────────────
-    # General sweep — mainly for drops, which can happen anytime and
-    # aren't time-sensitive enough to need frequent polling. Runs hourly
-    # instead of every 20 min to keep API/consumption load down.
-    @tasks.loop(hours=1)
+    # General sweep — mainly for drops, which can happen anytime. Every
+    # 5 min for near-immediate reporting — still a trivial request volume
+    # (public, unauthenticated endpoint, same call the Fantrax website
+    # itself makes on page load).
+    @tasks.loop(minutes=5)
     async def check_transactions(self):
-        await self._check_and_post(source="hourly sweep")
+        await self._check_and_post(source="5-min sweep")
 
     @check_transactions.before_loop
     async def before_check_transactions(self):
@@ -242,8 +243,11 @@ class TransactionTracker(commands.Cog):
     async def before_check_waiver_batch(self):
         await self.bot.wait_until_ready()
 
-    # Commands
+    # Commands — debug commands are gated to manage_guild so Discord hides
+    # them from the slash-command picker for regular league members
+    # entirely, not just blocked-on-run.
     @app_commands.command(name='faabdebug', description='(Debug) Inspect standings data for FAAB remaining info')
+    @app_commands.default_permissions(manage_guild=True)
     async def faabDebug(self, interaction: discord.Interaction) -> None:
         standings = self.api.standings()
         lines = []
@@ -259,12 +263,14 @@ class TransactionTracker(commands.Cog):
             await interaction.followup.send(f"```\n{text[chunk_start:chunk_start+1900]}\n```")
 
     @app_commands.command(name='teamsdebug', description='(Debug) List all league teams with their Fantrax IDs')
+    @app_commands.default_permissions(manage_guild=True)
     async def teamsDebug(self, interaction: discord.Interaction) -> None:
         lines = [f"{t.name} (short={t.short}) | id={t.id}" for t in self.api.teams]
         text = "\n".join(lines) or "No teams returned."
         await interaction.response.send_message(f"```\n{text[:1900]}\n```")
 
     @app_commands.command(name='biddebug', description='(Debug) Dump full raw row/cell data to locate FAAB bid amounts')
+    @app_commands.default_permissions(manage_guild=True)
     async def bidDebug(self, interaction: discord.Interaction) -> None:
         txns = self.api.transactions(count=30)
         # No CLAIM-type rows exist in this league's feed — widen to WW/FA,
@@ -298,6 +304,7 @@ class TransactionTracker(commands.Cog):
             await interaction.followup.send(f"```\n{text[chunk_start:chunk_start+1900]}\n```")
 
     @app_commands.command(name='transactiondebug', description='(Debug) Dump raw recent Fantrax transactions')
+    @app_commands.default_permissions(manage_guild=True)
     async def transactionDebug(self, interaction: discord.Interaction) -> None:
         txns = self.api.transactions(count=20)
         lines = []

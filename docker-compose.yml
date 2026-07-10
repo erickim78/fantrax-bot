@@ -20,7 +20,8 @@ services:
     # bandwidth control compiled in, so a `cpus:`/NanoCPUs limit fails at
     # container creation ("NanoCPUs can not be set..."). Memory cgroups
     # are supported much more broadly, so we keep that cap. This bot is
-    # genuinely lightweight (idle process, one API call/hour + one/day),
+    # genuinely lightweight (idle process, ~2 small unauthenticated API
+    # calls/5min across both trackers, plus one/day for the waiver batch),
     # so 256M is generous headroom, not a tight squeeze — it exists so a
     # bug/runaway loop can't grow unbounded and pressure Plex, not because
     # normal operation is expected to get close to it. If you want a CPU

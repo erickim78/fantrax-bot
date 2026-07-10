@@ -38,9 +38,12 @@ changes — no rebuild needed unless `requirements.txt` changes.
 - **Exception:** `League.pending_trades()` (returns `Trade` objects)
   explicitly requires an authenticated session and raises `NotLoggedIn`
   otherwise — this is true regardless of the league's public/private
-  setting. This matters for the trade-poster work (see "Next steps"
-  below) — we deliberately have NOT built the login/cookie flow yet
-  since we paused there.
+  setting. **We don't use this method** — the trade poster (see gotcha #9
+  below) reads *executed* trades from the same public endpoint
+  `transactions()` uses, under a different `view` param, which needs no
+  login at all. `pending_trades()` remains true and undocumented-gotcha
+  material for whoever eventually wants pre-approval trade previews, but
+  it's not on the critical path for anything currently built.
 - FAAB: $1,500 annual rollover cap, redistributed equally each year.
   `fantraxapi` does **not** expose a "FAAB remaining" field anywhere
   (checked `Team`, `League`, and `Standings`/`Record` objects directly
@@ -96,6 +99,29 @@ changes — no rebuild needed unless `requirements.txt` changes.
 8. **Python print() output is buffered by default in containers** — set
    `ENV PYTHONUNBUFFERED=1` in the Dockerfile or `docker logs` won't show
    output in real time (or possibly at all until buffer flushes).
+9. **Executed trades are retrievable with NO login**, via the same public
+   `getTransactionDetailsHistory` endpoint `League.transactions()` uses —
+   just pass `view="TRADE"` instead of the library's hardcoded default
+   (`CLAIM_DROP`). Confirmed by probing the raw response: the default
+   view's `displayedLists.tabs` lists `{"name": "Trade", "id": "TRADE"}`
+   alongside Claim/Drop. `League.transactions()` never exposes a `view`
+   kwarg, so `cogs/tradestracker.py` bypasses it and calls
+   `fantraxapi.api.Method`/`request` directly. The row shape under
+   `view="TRADE"` is also different from Claim/Drop's and will crash the
+   library's `Transaction()` parser if you try to feed it in — no
+   `transactionCode` key at all; instead each row is one asset with `key:
+   "from"`/`"to"` cells (both have `.teamId`, use that not `.content`,
+   per gotcha #4) and one of three shapes:
+   - player: `row["scorer"]["name"]`
+   - draft pick: `row["draftPickDisplayParts"]` — `roundInfo`/`year` are
+     HTML fragments (e.g. `"Round <b>1</b> (Horny Mushrooms)"`,
+     `"<b>2029</b> Draft Pick"`), parsed via regex in
+     `tradestracker.py`'s `PICK_ROUND_RE`/`PICK_YEAR_RE`.
+   - FAAB cash throw-in: `row["budgetAmountTradeObj"]["budget"]` (e.g.
+     `"$100.00"`) — has neither of the above, discovered when it crashed
+     the initial player-only parser on a real trade.
+   All rows sharing a `txSetId` belong to the same trade; rows come back
+   newest-first, same as the Claim/Drop feed.
 
 ## Discord formatting conventions
 
@@ -114,22 +140,20 @@ changes — no rebuild needed unless `requirements.txt` changes.
 
 ## Next steps (where we left off)
 
-**Trade poster** — the actual next feature to build. Needs:
-1. The login/cookie auth flow for `pending_trades()` (deliberately not
-   built yet — see gotcha above). The bot's `commands.py` cog already
-   does `FantraxAPI(config.leagueId)` with no session, which only
-   works for public endpoints; `pending_trades()` needs a real
-   authenticated session on top of that.
-2. Format `Trade`/`TradeDraftPick`/`TradePlayer` objects (structurally
-   different from `Transaction`/`TransactionPlayer` — has proper
-   proposed/accepted/executed lifecycle fields and models pick-for-player
-   trades properly).
-3. User is fine posting **pending** trades (not just fully-executed
-   ones) since pending trades in this league just need commissioner
-   approval before executing anyway — pending is an acceptable proxy for
-   "trade happened."
-4. Apply the `▬▬▬` divider treatment discussed above, matching the
-   `#news`-channel-sharing decision.
+**Trade poster status:** built — `cogs/tradestracker.py`, a separate cog
+from `transactionstracker.py` for modularity (own hourly loop, own
+`posted_trades.json` state file, dedup by `txSetId`). Reads *executed*
+trades off the public unauthenticated endpoint (see gotcha #9) rather
+than `pending_trades()`, so no login/cookie flow was needed after all —
+an earlier version of this plan added `config.fantraxCookies` and a
+`requests.Session`-based login for `pending_trades()`, but that was
+scrapped once the no-login `view="TRADE"` path was found; don't
+reintroduce it without a real need. Formatting matches the
+`▬▬▬`-divider/`#news`-sharing conventions above, escalating `🚨`→`🚨🚨`
+at 3+ combined players+picks moved (a size heuristic, not real editorial
+judgment). `DRY_RUN = True` by default — flip once `/tradedebug` output
+looks right, same two-step rollout `transactionstracker.py` used.
+Not yet verified against a live unattended run on the NAS.
 
 **Transaction announcer status:** fully built and formatting-complete
 (tweet-style, bid amounts included). Was mid-way through final NAS

@@ -131,6 +131,7 @@ dmypy.json
 # Config files
 config.py
 posted_transactions.json
+posted_trades.json
 
 # Log files
 discord.log
