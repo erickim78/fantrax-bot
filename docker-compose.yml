@@ -1,0 +1,46 @@
+# Add this service block to your existing docker-compose.yml (the same
+# one running your arr stack / Plex / VPN), or keep it in its own
+# docker-compose.yml in the bot's project folder — either works, they
+# don't need to be the same file/network as your other containers.
+
+services:
+  fantrax-bot:
+    build: .              # points at the Dockerfile in this same folder
+    container_name: fantrax-bot
+    restart: unless-stopped
+
+    # Bind-mount the actual bot code from the NAS filesystem. Edit
+    # main.py/config.py/cogs/*.py directly on the NAS (File Station, SSH,
+    # or a mapped network drive) and `docker compose restart fantrax-bot`
+    # to pick up changes — no rebuild needed.
+    volumes:
+      - ./:/app
+
+    # Memory limit only — Synology's DSM kernel commonly lacks CFS
+    # bandwidth control compiled in, so a `cpus:`/NanoCPUs limit fails at
+    # container creation ("NanoCPUs can not be set..."). Memory cgroups
+    # are supported much more broadly, so we keep that cap. This bot is
+    # genuinely lightweight (idle process, one API call/hour + one/day),
+    # so 256M is generous headroom, not a tight squeeze — it exists so a
+    # bug/runaway loop can't grow unbounded and pressure Plex, not because
+    # normal operation is expected to get close to it. If you want a CPU
+    # cap too, Synology's Container Manager GUI sometimes exposes a
+    # "CPU priority" setting per-container that doesn't hit this same
+    # kernel limitation — worth checking there if it matters to you.
+    mem_limit: 256m
+
+    # Deliberately NOT attached to your VPN container's network — this
+    # bot has no reason to route through it (no torrenting/anonymity
+    # need), and some VPN exit IPs get flagged/blocked by Discord or
+    # Fantrax. Leave it on the default bridge network.
+
+    # If your other services use a shared external network for reasons
+    # like a reverse proxy, this bot doesn't need that either — it makes
+    # outbound calls only (Discord gateway, Fantrax API), no inbound
+    # traffic to route to it.
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"    # prevents log files from growing unbounded
+        max-file: "3"

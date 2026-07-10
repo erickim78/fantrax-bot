@@ -120,21 +120,51 @@ class TransactionTracker(commands.Cog):
         drops_bold = ", ".join(f"**{n}**" for n in drops)
         other_bold = ", ".join(f"**{n}**" for n in other)
 
-        # Insider-style anchors, mirroring the trade-blurb pattern:
-        # short emoji tag + one clean sentence, no analysis/headers.
+        # FAAB bid amount — confirmed via /biddebug to live at cells[1] on
+        # the first raw row of an add-type transaction (this is also the
+        # cell the library's buggy date parser was misreading as a date).
+        # Only meaningful when there's an actual add in this transaction.
+        bid_phrase = ""
+        if adds:
+            bid = self._get_bid_amount(txn)
+            if bid is not None:
+                bid_phrase = f" for ${bid}"
+
+        # Tweet-style phrasing: "adding X for $Y, and dropping Z to make
+        # room" reads closer to how FAAB pickups actually get reported
+        # than a more formal "waiving" construction.
         if adds and drops:
             return (
-                f"🔁 WAIVER MOVE: {team_tag} are adding {adds_bold}, "
-                f"waiving {drops_bold} in a corresponding move."
+                f"📝 {team_tag} are adding {adds_bold}{bid_phrase}, "
+                f"and dropping {drops_bold} to make room."
             )
         elif adds:
-            return f"📝 SIGNING: {team_tag} are adding {adds_bold} off waivers."
+            return f"📝 {team_tag} are adding {adds_bold}{bid_phrase} off waivers."
         elif drops:
-            return f"✂️ CUT: {team_tag} are waiving {drops_bold}."
+            return f"✂️ {team_tag} are dropping {drops_bold}."
         elif other:
-            return f"🔄 ROSTER MOVE: {team_tag} are moving {other_bold}."
+            return f"🔄 {team_tag} are moving {other_bold}."
         else:
-            return f"🔄 ROSTER MOVE: {team_tag} made a roster move."
+            return f"🔄 {team_tag} made a roster move."
+
+    @staticmethod
+    def _get_bid_amount(txn):
+        """Extract the FAAB bid amount from the raw transaction data.
+        Confirmed via /biddebug: row[0].cells[1] holds it as a string like
+        '10.00' for FA/WW/CLAIM-type transactions. Returns None if it's
+        not present or doesn't look like a plausible bid amount (guards
+        against DROP-only transactions, which don't have this cell in the
+        same position, or any future format we haven't seen yet)."""
+        try:
+            cells = txn._data[0].get("cells", [])
+            raw = cells[1].get("content", "") if len(cells) > 1 else ""
+            # Bid amounts look like '10.00', '0.00', '24.00' — a plain
+            # non-negative decimal number.
+            if raw and raw.replace(".", "", 1).isdigit():
+                return raw
+        except (IndexError, KeyError, AttributeError, TypeError):
+            pass
+        return None
 
     # ── shared fetch/format/post logic (used by both loops) ──────────
     async def _check_and_post(self, source: str):
@@ -169,18 +199,21 @@ class TransactionTracker(commands.Cog):
         # NOTE: deliberately NOT wrapped in a ``` code block — Discord does
         # not parse <@&ID> mention syntax inside code fences, which would
         # make every role tag render as literal text instead of a mention.
+        # Double newline between lines matches the visual paragraph-gap
+        # look of the manually-posted trade announcements.
         ordered_lines = list(reversed(new_lines))
         chunk = []
         chunk_len = 0
         for line in ordered_lines:
-            if chunk_len + len(line) + 1 > 1900 and chunk:
-                await channel.send("\n".join(chunk))
+            # +2 for the blank line that will separate it from the next
+            if chunk_len + len(line) + 2 > 1900 and chunk:
+                await channel.send("\n\n".join(chunk))
                 chunk = []
                 chunk_len = 0
             chunk.append(line)
-            chunk_len += len(line) + 1
+            chunk_len += len(line) + 2
         if chunk:
-            await channel.send("\n".join(chunk))
+            await channel.send("\n\n".join(chunk))
 
         self.posted_ids |= newly_posted
         self._save_posted_ids()
@@ -210,11 +243,59 @@ class TransactionTracker(commands.Cog):
         await self.bot.wait_until_ready()
 
     # Commands
+    @app_commands.command(name='faabdebug', description='(Debug) Inspect standings data for FAAB remaining info')
+    async def faabDebug(self, interaction: discord.Interaction) -> None:
+        standings = self.api.standings()
+        lines = []
+        for record in standings.records.values() if hasattr(standings, "records") else []:
+            lines.append(f"team={getattr(record, 'team', None)} | vars={vars(record)}")
+        if not lines:
+            # Fallback in case the attribute name isn't "records" — dump
+            # whatever the Standings object itself looks like instead.
+            lines.append(f"standings_vars={vars(standings)}")
+        text = "\n".join(lines) or "No data."
+        await interaction.response.send_message(f"```\n{text[:1900]}\n```")
+        for chunk_start in range(1900, len(text), 1900):
+            await interaction.followup.send(f"```\n{text[chunk_start:chunk_start+1900]}\n```")
+
     @app_commands.command(name='teamsdebug', description='(Debug) List all league teams with their Fantrax IDs')
     async def teamsDebug(self, interaction: discord.Interaction) -> None:
         lines = [f"{t.name} (short={t.short}) | id={t.id}" for t in self.api.teams]
         text = "\n".join(lines) or "No teams returned."
         await interaction.response.send_message(f"```\n{text[:1900]}\n```")
+
+    @app_commands.command(name='biddebug', description='(Debug) Dump full raw row/cell data to locate FAAB bid amounts')
+    async def bidDebug(self, interaction: discord.Interaction) -> None:
+        txns = self.api.transactions(count=30)
+        # No CLAIM-type rows exist in this league's feed — widen to WW/FA,
+        # since the bid amount (if present at all) likely lives on one of
+        # those instead.
+        candidate_txns = [
+            t for t in txns
+            if any(getattr(p, "type", "").upper() in ("CLAIM", "WW", "FA") for p in t.players)
+        ]
+
+        if not candidate_txns:
+            await interaction.response.send_message("No FA/WW/CLAIM transactions found in the last 30.")
+            return
+
+        lines = []
+        # Dump every row (not just row 0) and every cell in each row, so we
+        # can see the full raw structure and spot where a bid number sits.
+        for t in candidate_txns[:5]:  # a handful of examples is enough
+            player_types = [(p.name, getattr(p, "type", None)) for p in t.players]
+            lines.append(f"=== txn {t.id} | team={t.team.name} | players={player_types} ===")
+            for row_idx, row in enumerate(t._data):
+                cell_dump = " || ".join(
+                    f"[{i}]={c.get('content', '')!r}"
+                    for i, c in enumerate(row.get("cells", []))
+                )
+                lines.append(f"  row[{row_idx}]: {cell_dump}")
+
+        text = "\n".join(lines) or "No data."
+        await interaction.response.send_message(f"```\n{text[:1900]}\n```")
+        for chunk_start in range(1900, len(text), 1900):
+            await interaction.followup.send(f"```\n{text[chunk_start:chunk_start+1900]}\n```")
 
     @app_commands.command(name='transactiondebug', description='(Debug) Dump raw recent Fantrax transactions')
     async def transactionDebug(self, interaction: discord.Interaction) -> None:
