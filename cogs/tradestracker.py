@@ -1,7 +1,9 @@
 # Dependencies
 import json
 import re
+from datetime import datetime as _dt
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Files
 import config
@@ -22,7 +24,7 @@ from discord import app_commands
 
 # Shares #news with transactionstracker.py — user explicitly wants trades
 # and transactions in the same channel, not split out (see CLAUDE.md).
-TRADE_CHANNEL_ID = config.transactionChannelId
+TRADE_CHANNEL_ID = config.newsChannelId
 
 STATE_FILEPATH = Path(__file__).resolve().parent.parent / "posted_trades.json"
 
@@ -62,6 +64,12 @@ TRADE_VIEW = "TRADE"
 PICK_ROUND_RE = re.compile(r"Round\s*<b>(\d+)</b>\s*\(([^)]+)\)")
 PICK_YEAR_RE = re.compile(r"<b>(\d+)</b>")
 
+# The "date" cell's header literally says "Date Processed (EDT)" — always
+# labeled EDT regardless of actual DST state, so we use the America/New_York
+# zone (not a fixed UTC-4 offset) to get DST transitions right automatically.
+TRADE_DATE_FORMAT = "%a %b %d, %Y, %I:%M%p"
+TRADE_TZ = ZoneInfo("America/New_York")
+
 
 def role_tag(team) -> str:
     team_id = getattr(team, "id", None)
@@ -76,14 +84,6 @@ def _ordinal(n: str) -> str:
     else:
         suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
-
-
-def _english_list(items: list) -> str:
-    if len(items) == 1:
-        return items[0]
-    if len(items) == 2:
-        return f"{items[0]} and {items[1]}"
-    return ", ".join(items[:-1]) + f", and {items[-1]}"
 
 
 class TradesTracker(commands.Cog):
@@ -138,9 +138,7 @@ class TradesTracker(commands.Cog):
     def _cell(row, key):
         return next((c for c in row["cells"] if c["key"] == key), None)
 
-    def _row_item_text(self, row) -> tuple:
-        """Returns (text, is_player). is_player drives the "who's
-        acquiring" heuristic in format_trade below."""
+    def _row_item_text(self, row) -> str:
         pick = row.get("draftPickDisplayParts")
         if pick:
             round_match = PICK_ROUND_RE.search(pick.get("roundInfo", ""))
@@ -154,64 +152,66 @@ class TradesTracker(commands.Cog):
             # 1st-round pick (Horny Mushrooms)" posted even when Horny
             # Mushrooms was the one sending it).
             owner_note = f" ({owner_name})" if owner_name else ""
-            return f"a {year} {_ordinal(round_num)}-round pick{owner_note}", False
+            return f"a {year} {_ordinal(round_num)}-round pick{owner_note}"
 
         # FAAB cash throw-in — confirmed via /tradedebug: has neither
         # draftPickDisplayParts nor a usable scorer.name, just this dict.
         budget = row.get("budgetAmountTradeObj")
         if budget:
-            return f"{budget.get('budget', '?')} in cash considerations", False
+            return f"{budget.get('budget', '?')} in cash considerations"
 
-        return f"**{row['scorer']['name']}**", True
+        return f"**{row['scorer']['name']}**"
 
-    def format_trade(self, rows: list) -> str:
+    def _trade_timestamp(self, rows: list):
+        date_cell = self._cell(rows[0], "date")
+        if date_cell and date_cell.get("content"):
+            try:
+                return _dt.strptime(date_cell["content"], TRADE_DATE_FORMAT).replace(tzinfo=TRADE_TZ)
+            except ValueError:
+                pass
+        return discord.utils.utcnow()
+
+    def format_trade_embed(self, rows: list) -> discord.Embed:
         # Group moves by the team receiving them, generically rather than
-        # assuming exactly two sides (a trade could involve more).
+        # assuming exactly two sides (a trade could involve more) — each
+        # team gets its own field, so this needs no "who's acquiring"
+        # narrative logic the way the old plain-text version did.
         by_team = {}
         for row in rows:
             to_team = self.api.team(self._cell(row, "to")["teamId"])
-            entry = by_team.setdefault(to_team.id, {"team": to_team, "items": [], "got_player": False})
-            text, is_player = self._row_item_text(row)
-            entry["items"].append(text)
-            entry["got_player"] = entry["got_player"] or is_player
+            entry = by_team.setdefault(to_team.id, {"team": to_team, "items": []})
+            entry["items"].append(self._row_item_text(row))
 
-        # Only big trades get called out — everything else just posts
-        # plain, no siren/prefix at all.
-        prefix = "🚨 BREAKING: " if len(rows) >= BREAKING_ASSET_THRESHOLD else ""
-
-        if len(by_team) != 2:
-            # 3+ team trade (rare in a 10-team league, but possible) — the
-            # "X are acquiring ... from Y in exchange for ..." phrasing
-            # only reads naturally for a two-sided trade, so fall back to
-            # a flat per-team breakdown instead of guessing at a headline.
-            sides = "; ".join(
-                f"{role_tag(entry['team'])} get {_english_list(entry['items'])}"
-                for entry in by_team.values()
-            )
-            return f"{prefix}{sides}."
-
-        # Lead with whichever side landed a player — a pick/FAAB-only
-        # return never leads the headline, matching how these have always
-        # been written manually (e.g. "Goat James are acquiring Maluach
-        # and Ighodaro... in exchange for a 2nd" — Goat James leads
-        # despite Homoerotic Knights' side being the one with row 0's
-        # asset). When both sides get a player (a straight swap), that
-        # signal ties, so fall back to whichever team the API's first row
-        # sent its asset to, for a stable/deterministic pick either way.
-        entries = list(by_team.values())
-        player_sides = [e for e in entries if e["got_player"]]
-        if len(player_sides) == 1:
-            acquiring, other = player_sides[0], next(e for e in entries if e is not player_sides[0])
-        else:
-            first_to_id = self.api.team(self._cell(rows[0], "to")["teamId"]).id
-            acquiring = by_team[first_to_id]
-            other = next(e for e in entries if e is not acquiring)
-
-        return (
-            f"{prefix}{role_tag(acquiring['team'])} are acquiring "
-            f"{_english_list(acquiring['items'])} from {role_tag(other['team'])} "
-            f"in exchange for {_english_list(other['items'])}."
+        # Only big trades get the siren treatment — everything else posts
+        # with a calmer title/color, no callout.
+        is_big = len(rows) >= BREAKING_ASSET_THRESHOLD
+        embed = discord.Embed(
+            title="🚨 BREAKING TRADE" if is_big else "🔄 Trade Executed",
+            color=discord.Color.red() if is_big else discord.Color.blue(),
         )
+        # Bot's own avatar as the branding icon — matches
+        # transactionstracker.py's embeds, and avoids reusing the big
+        # conch illustration from /askshams which isn't sized for this.
+        embed.set_author(name="Shams-kun", icon_url=self.bot.user.display_avatar.url)
+        embed.timestamp = self._trade_timestamp(rows)
+
+        # NOTE: mentions only get parsed by Discord in an embed's
+        # description/field VALUE, not in field names — a role tag placed
+        # in the name renders as literal `<@&ID>` text instead of the
+        # colored mention. So "receive" goes right after the mention
+        # inside the value, not in the field name (which would either
+        # repeat the team name or fail to render the mention at all).
+        # Field name itself is left blank (Discord requires non-empty,
+        # hence the zero-width space).
+        for entry in by_team.values():
+            items_block = "\n".join(f"• {item}" for item in entry["items"])
+            embed.add_field(
+                name="​",
+                value=f"{role_tag(entry['team'])} receive:\n{items_block}",
+                inline=True,
+            )
+
+        return embed
 
     # ── shared fetch/format/post logic ──────────────────────────────
     async def _check_and_post(self):
@@ -228,7 +228,10 @@ class TradesTracker(commands.Cog):
         if DRY_RUN:
             print("[TradesTracker DRY RUN] Would post:")
             for tid in reversed(new_ids):
-                print("  ", self.format_trade(groups[tid]))
+                embed = self.format_trade_embed(groups[tid])
+                print(f"  [{embed.title}]")
+                for f in embed.fields:
+                    print(f"    {f.name}: {f.value}")
             return
 
         channel = self.bot.get_channel(TRADE_CHANNEL_ID)
@@ -237,11 +240,11 @@ class TradesTracker(commands.Cog):
             return
 
         # Oldest-first so the feed reads chronologically, same convention
-        # as transactionstracker.py. One message per trade — save
+        # as transactionstracker.py. One message (embed) per trade — save
         # immediately after each send so a mid-loop crash can't leave an
         # already-posted trade unrecorded.
         for tid in reversed(new_ids):
-            await channel.send(self.format_trade(groups[tid]))
+            await channel.send(embed=self.format_trade_embed(groups[tid]))
             self.posted_ids.add(tid)
             self._save_posted_ids()
 
@@ -278,12 +281,16 @@ class TradesTracker(commands.Cog):
             rows = groups[tid]
             date_cell = self._cell(rows[0], "date")
             lines.append(f"{tid} | date={date_cell['content'] if date_cell else '?'} | items={len(rows)}")
-            lines.append(f"    → {self.format_trade(rows)}")
         text = "\n".join(lines)
 
         await interaction.response.send_message(f"```\n{text[:1900]}\n```")
         for chunk_start in range(1900, len(text), 1900):
             await interaction.followup.send(f"```\n{text[chunk_start:chunk_start+1900]}\n```")
+
+        # Also send real rendered embeds (capped) so the actual visual
+        # output can be checked, not just raw metadata.
+        for tid in order[:5]:
+            await interaction.followup.send(embed=self.format_trade_embed(groups[tid]))
 
 
 async def setup(bot):

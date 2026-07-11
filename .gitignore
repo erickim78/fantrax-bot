@@ -132,6 +132,9 @@ dmypy.json
 config.py
 posted_transactions.json
 posted_trades.json
+posted_power_rankings.json
+posted_player_stats.json
+posted_trade_grades.json
 
 # Log files
 discord.log

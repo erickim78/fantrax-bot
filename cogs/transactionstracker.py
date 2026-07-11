@@ -49,7 +49,7 @@ _fantrax_transaction_module.datetime = _SafeDatetimeParser
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────
 
-TRANSACTION_CHANNEL_ID = config.transactionChannelId  # ← add this to config.py
+TRANSACTION_CHANNEL_ID = config.newsChannelId
 
 # Anchored to the project root (one level up from cogs/) rather than a bare
 # relative path, so it lands in the same place regardless of what directory
@@ -107,7 +107,9 @@ class TransactionTracker(commands.Cog):
     # date, not just occasional bad rows). We don't use dates anywhere in
     # the announcement format, so we no longer gate on date validity at
     # all — dedup is handled entirely by posted_ids/txn.id below.
-    def format_transaction_line(self, txn) -> str:
+    def _classify_transaction(self, txn) -> tuple:
+        """Returns (line_text, color) — shared by the live embed, the
+        DRY_RUN console preview, and /transactiondebug."""
         adds = [p.name for p in txn.players if getattr(p, "type", "").upper() in ADD_TYPES]
         drops = [p.name for p in txn.players if getattr(p, "type", "").upper() in DROP_TYPES]
         other = [
@@ -132,20 +134,40 @@ class TransactionTracker(commands.Cog):
 
         # Tweet-style phrasing: "adding X for $Y, and dropping Z to make
         # room" reads closer to how FAAB pickups actually get reported
-        # than a more formal "waiving" construction.
+        # than a more formal "waiving" construction. Color loosely
+        # matches the move type: green = any add (including a sign-and-
+        # drop, since the headline is still "acquired a player"), red =
+        # pure cut, blurple = anything else.
         if adds and drops:
-            return (
+            text = (
                 f"📝 {team_tag} are adding {adds_bold}{bid_phrase}, "
                 f"and dropping {drops_bold} to make room."
             )
+            color = discord.Color.green()
         elif adds:
-            return f"📝 {team_tag} are adding {adds_bold}{bid_phrase} off waivers."
+            text = f"📝 {team_tag} are adding {adds_bold}{bid_phrase} off waivers."
+            color = discord.Color.green()
         elif drops:
-            return f"✂️ {team_tag} are dropping {drops_bold}."
+            text = f"✂️ {team_tag} are dropping {drops_bold}."
+            color = discord.Color.red()
         elif other:
-            return f"🔄 {team_tag} are moving {other_bold}."
+            text = f"🔄 {team_tag} are moving {other_bold}."
+            color = discord.Color.blurple()
         else:
-            return f"🔄 {team_tag} made a roster move."
+            text = f"🔄 {team_tag} made a roster move."
+            color = discord.Color.blurple()
+
+        return text, color
+
+    def format_transaction_embed(self, txn) -> discord.Embed:
+        text, color = self._classify_transaction(txn)
+        embed = discord.Embed(description=text, color=color)
+        # Bot's own avatar as the branding icon — already square/sized
+        # correctly for this, unlike the big conch image used in
+        # /askshams which is a full illustration, not an icon.
+        embed.set_author(name="Shams-kun", icon_url=self.bot.user.display_avatar.url)
+        embed.timestamp = discord.utils.utcnow()
+        return embed
 
     @staticmethod
     def _get_bid_amount(txn):
@@ -170,22 +192,20 @@ class TransactionTracker(commands.Cog):
     async def _check_and_post(self, source: str):
         txns = self.api.transactions(count=100)
 
-        new_lines = []
-        newly_posted = set()
-
+        new_entries = []  # list of (txn.id, txn)
         for txn in txns:
             if txn.id in self.posted_ids:
                 continue
-            new_lines.append(self.format_transaction_line(txn))
-            newly_posted.add(txn.id)
+            new_entries.append((txn.id, txn))
 
-        if not new_lines:
+        if not new_entries:
             return
 
         if DRY_RUN:
             print(f"[TransactionTracker DRY RUN — {source}] Would post:")
-            for line in new_lines:
-                print("  ", line)
+            for _, txn in new_entries:
+                text, _ = self._classify_transaction(txn)
+                print("  ", text)
             return
 
         channel = self.bot.get_channel(TRANSACTION_CHANNEL_ID)
@@ -193,30 +213,17 @@ class TransactionTracker(commands.Cog):
             print(f"[TransactionTracker] Channel {TRANSACTION_CHANNEL_ID} not found.")
             return
 
-        # Post oldest-first so the feed reads chronologically. Chunk into
-        # multiple messages if needed — midnight PST waiver processing can
-        # dump many claims at once, and Discord caps messages at 2000 chars.
-        # NOTE: deliberately NOT wrapped in a ``` code block — Discord does
-        # not parse <@&ID> mention syntax inside code fences, which would
-        # make every role tag render as literal text instead of a mention.
-        # Double newline between lines matches the visual paragraph-gap
-        # look of the manually-posted trade announcements.
-        ordered_lines = list(reversed(new_lines))
-        chunk = []
-        chunk_len = 0
-        for line in ordered_lines:
-            # +2 for the blank line that will separate it from the next
-            if chunk_len + len(line) + 2 > 1900 and chunk:
-                await channel.send("\n\n".join(chunk))
-                chunk = []
-                chunk_len = 0
-            chunk.append(line)
-            chunk_len += len(line) + 2
-        if chunk:
-            await channel.send("\n\n".join(chunk))
-
-        self.posted_ids |= newly_posted
-        self._save_posted_ids()
+        # Post oldest-first so the feed reads chronologically. One message
+        # (embed) per transaction — save immediately after each send so a
+        # mid-loop crash can't leave an already-posted transaction
+        # unrecorded (matches tradestracker.py's convention). Role
+        # mentions inside embeds still render as the colored role name,
+        # they just don't trigger a ping — acceptable since Fantrax's own
+        # site already notifies everyone for transactions/trades.
+        for txn_id, txn in reversed(new_entries):
+            await channel.send(embed=self.format_transaction_embed(txn))
+            self.posted_ids.add(txn_id)
+            self._save_posted_ids()
 
     # ── background loops ──────────────────────────────────────────────
     # General sweep — mainly for drops, which can happen anytime. Every
@@ -311,7 +318,7 @@ class TransactionTracker(commands.Cog):
         for t in txns:
             players = [(p.name, getattr(p, "type", None)) for p in t.players]
             flag = " ⚠️ MALFORMED DATE (date unreliable, harmless — still posts)" if t.date == SENTINEL_DATE else ""
-            preview = self.format_transaction_line(t)
+            preview, _ = self._classify_transaction(t)
             lines.append(f"{t.id} | {t.date} | {t.team.name} | team_vars={vars(t.team)} | {players}{flag}")
             lines.append(f"    → {preview}")
         text = "\n".join(lines) or "No transactions returned."
@@ -319,6 +326,11 @@ class TransactionTracker(commands.Cog):
         await interaction.response.send_message(f"```\n{text[:1900]}\n```")
         for chunk_start in range(1900, len(text), 1900):
             await interaction.followup.send(f"```\n{text[chunk_start:chunk_start+1900]}\n```")
+
+        # Also send real rendered embeds (capped) so the actual visual
+        # output can be checked, not just raw metadata.
+        for t in txns[:5]:
+            await interaction.followup.send(embed=self.format_transaction_embed(t))
 
 
 async def setup(bot):
