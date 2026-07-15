@@ -218,8 +218,14 @@ def analyze_trade(api: FantraxAPI, trade_by_team: dict) -> dict:
         hypothetical_roster = [e for e in current_roster if e[0].id not in acquired_ids]
         hypothetical_roster += [global_lookup[pid] for pid in given_up_ids if pid in global_lookup]
 
-        ceiling_after = pr.lineup_ceiling(current_roster)
-        ceiling_before = pr.lineup_ceiling(hypothetical_roster)
+        # availability_filter="none" explicit here (matches lineup_ceiling's
+        # own default, but spelled out since it's load-bearing): confirmed
+        # live that ~29% of this league's rostered players are currently
+        # flagged injured/suspended, almost all a meaningless day_to_day
+        # "game-time decision" tag with no game to decide about during the
+        # offseason — trade value must never be silently zeroed by that.
+        ceiling_after = pr.lineup_ceiling(current_roster, availability_filter="none")
+        ceiling_before = pr.lineup_ceiling(hypothetical_roster, availability_filter="none")
 
         acquired_names, acquired_ages, acquired_rookies = _resolve(info["acquired_player_ids"])
         given_up_names, given_up_ages, given_up_rookies = _resolve(info["given_up_player_ids"])
@@ -281,7 +287,12 @@ Rules for length/structure). Weigh BOTH the computed lineup-value impact AND the
 out behind on pure computed value and still have made a defensible move if the return clearly \
 fits their timeline (e.g. young assets for a rebuilding team, proven production for a team in \
 win-now mode), and the verdict should reflect that (pulled toward "Even" or even the other \
-way) even when the computed value alone points elsewhere. Do not invent fantasy-team context, \
+way) even when the computed value alone points elsewhere. But magnitude matters: a large \
+computed value gap needs a genuinely commensurate return to be called close to "Even" — \
+timeline fit can soften a verdict, it shouldn't erase a large gap on its own, especially when \
+the return is just one modest asset (e.g. a single pick) against a clearly superior current \
+player. Reserve "Even" for a real-but-modest gap, or a return substantial enough (multiple \
+valuable assets, real draft capital) to plausibly close a larger one. Do not invent fantasy-team context, \
 needs, or motivations beyond what's given to you. The verdict and the narrative MUST agree — \
 never pick a lopsided verdict and then write a narrative that reads as roughly even, or vice \
 versa.

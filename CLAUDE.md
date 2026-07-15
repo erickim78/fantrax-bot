@@ -65,6 +65,11 @@ further down — this is just the actionable summary.
       `config.espnChannelId` on 2026-07-11) — if you're reading old notes
       or an old branch that still references `mediaChannelId`, that's
       stale, not a bug to fix.
+- [ ] Once `cogs/powerrankings.py`'s `DRY_RUN` flips to `False` for real:
+      decide whether to retire/disable `cogs/offseasonpowerrankings.py`
+      (built 2026-07-15) — running both simultaneously wouldn't break
+      anything, but would be confusing/redundant. See the "Offseason
+      power rankings" section further down for the full design.
 
 ## Structure
 
@@ -1174,3 +1179,343 @@ Analysis" field name). Verified with a real generation: bolded player
 names correctly, used exactly one ⚠️ in the risk paragraph (not spammed),
 and separately used *italics* for emphasis unprompted — reads sharp, not
 listicle-y.
+
+**Renamed "Trade Grade" → "Trade Analysis"** in the visible embed title
+and the `/tradegradedebug` command's picker description (2026-07-11).
+Internal names (`tradegrades.py`, `TradeGrades` class, `/tradegradedebug`
+itself, log messages, `posted_trade_grades.json`) deliberately left
+alone — user asked for the display name, not a full rename/refactor.
+
+**Two real bugs found and fixed while answering "does the model actually
+value picks vs. players?" (2026-07-11).**
+
+*Bug 1 — picks were never valued, confirmed structurally, left as-is on
+purpose.* `marginal_value_delta` is computed purely from `lineup_ceiling()`
+on rosters of PLAYERS — picks are parsed into a completely separate
+`picks_acquired`/`picks_given_up` list and never enter the lineup-value
+computation at all. For a picks-for-player trade, the "losing" side's
+computed number is just the negative of what the player alone was worth;
+pick quantity/quality never factors into the hidden ground-truth number
+Claude is told to weigh. This is the SAME deliberate decision as the
+earlier "no pick-value formula" call (no real market exists) — not a bug
+to fix, just confirmed and made explicit for the user.
+
+*Bug 2 — real, found while investigating the above.* Checking a genuine
+picks-for-player trade (Slaw Bunnies: 2 future 1sts for Giannis
+Antetokounmpo) turned up `marginal_value_delta = 0.00` on BOTH sides —
+not a fair valuation, an actual broken computation. Root cause: Giannis
+was flagged `Player.injured` (via `day_to_day`, tooltip "Knee -
+Game-time decision") by Fantrax's live data, and `_build_player_lookup()`
+excluded him ENTIRELY from `lineup_ceiling()` as a result — zero value,
+not reduced value — so both the "with Giannis" and "without Giannis"
+computations came out identical. Confirmed this wasn't isolated: **98 of
+337 rostered players league-wide (29%) currently carry an injured/
+suspended flag** — an implausibly high number that was itself the tell.
+Root cause of THAT: a `day_to_day`/"game-time decision" tag is
+definitionally about an upcoming game, and there are no NBA games right
+now (offseason) — so the flag is frozen at whatever it was the last time
+it got set (94 of the 98 flagged players are day_to_day-only) and has no
+live signal to refresh or clear until the season starts. Also confirmed
+this had silently corrupted the ALREADY-validated Kawhi/AD trade test
+used throughout this session: Anthony Davis is also day_to_day-flagged,
+so the "successful" +25.3/-25.2 validation was actually all Kawhi, with
+AD's real value silently zeroed the whole time — directionally still
+looked right, which is exactly why it went unnoticed.
+
+Surveyed the specific flag combinations league-wide before fixing, to
+confirm Fantrax's data actually supports a real severity distinction
+(not just "some players are flagged"): `day_to_day` tooltips read like
+noisy, game-day-only text ("Illness - Game-time decision" — 94 players);
+`out` tooltips are a genuinely more serious, longer-duration signal
+("Knee - Out Indefinitely", "Achilles - Out Indefinitely" — 4 players,
+Jimmy Butler's even estimates "about a month"). Zero players currently
+`injured_reserve` or `suspended`. Deliberately did NOT attempt to parse
+the free-text tooltips for exact recovery timelines — unstructured NBA-
+news prose, fragile to parse reliably, not worth the maintenance risk
+over the clean boolean tier Fantrax already provides.
+
+**Fix**: `_build_player_lookup()` (`powerrankings.py`) gained an
+`availability_filter` param — `"strict"` (default) excludes Inj Res
+roster-slot status plus `out`/`injured_reserve`/`suspended`, but
+deliberately NOT pure `day_to_day` anymore (too short-term/noisy on its
+own, and definitionally stale without a live game); `"none"` excludes
+nobody on availability grounds at all. Threaded through both call sites
+with DIFFERENT defaults matching their actual job: `simulate_team_period()`
+(the real day-by-day power-rankings forecast) defaults to `"strict"` —
+correctly excluding genuine near-term unavailability. `lineup_ceiling()`
+(trade grading — an asset-VALUE question, not a forecast) defaults to
+`"none"` — a player's current health status shouldn't zero out their
+trade value; an out-indefinitely star still has real trade value once
+healthy. `tradegrades.py`'s `analyze_trade()` passes `availability_filter=
+"none"` explicitly (redundant with the default, kept explicit since it's
+load-bearing).
+
+Verified against real data: re-ran ALL 7 real trades in this league's
+history through the fixed `analyze_trade()`. The two previously-broken
+0.00/0.00 trades now show real, sensible deltas (Giannis: +24.25/-25.66,
+Giddey: +9.92/-18.24). Two OTHER trades still legitimately show 0.00
+(Draymond Green, Oso Ighodaro/Khaman Maluach) — checked these
+specifically to make sure the fix didn't paper over a different bug:
+both are genuine positional-logjam zeros (e.g. Draymond's fp_g of 25.6
+ranks 9th among his own team's PF/F/C-eligible players — Wembanyama,
+Murphy, Amen Thompson, Ingram, Jackson, Buzelis, Aldama, Ausar Thompson
+all rank ahead of him), not a data bug — confirmed by directly comparing
+lineup_ceiling with/without each player and cross-checking the roster's
+actual depth at that position. Also confirmed the "strict" tier still
+correctly excludes real `out`-flagged players (Jimmy Butler, Vince
+Williams, Moses Moody, Donte DiVincenzo) while including day_to_day-only
+players like Giannis — the power-rankings forecast path is unaffected
+except for the specific day_to_day fix.
+
+**Added a magnitude/proportionality guardrail (2026-07-11), same
+conversation.** User's follow-up concern: since picks are never valued
+(confirmed above) and the prompt explicitly permits timeline fit to pull
+a verdict toward "Even" even when computed value points elsewhere,
+nothing stops the model from calling something like "1 late pick for
+Jokic" roughly even purely because the rebuild-vs-contend story sounds
+right — a real risk given there's no anchor for pick magnitude at all.
+
+Tested this exact scenario BEFORE changing anything (a real generation,
+not assumed): a fabricated but realistic trade (Nikola Jokic, computed
+delta ±22, for a single future 1st, contender-9-1 vs. rebuilder-2-8)
+came back "Slightly favors Win Now Wolves" with "you don't give up the
+best player in the deal and call it even" in the narrative — the model
+already handled it reasonably on its own. But there was no EXPLICIT rule
+guaranteeing that outcome, just the model reasoning it out — and LLM
+output isn't fully deterministic, so this isn't something to rely on
+without a real safeguard.
+
+Added one guardrail sentence to `_SYSTEM_PROMPT`'s "Your job" paragraph:
+a large computed value gap needs a genuinely commensurate return to be
+called close to "Even"; timeline fit can soften a verdict but shouldn't
+erase a large gap on its own, especially against a single modest asset.
+Deliberately still no numeric pick-value formula — this anchors
+proportionality to the REAL computed magnitude already available, not
+an invented pick-value number.
+
+Cost-checked before shipping (user asked specifically): the added text
+is ~153 tokens, ~$0.0008/call extra on an already-~$0.02-0.025/call
+feature that only fires per real trade — negligible. Re-ran the same
+Jokic test with the new guardrail in place: same correct verdict
+("Slightly favors Win Now Wolves"), and the reasoning got noticeably
+more explicit about the mismatch — "one distant pick rarely matches a
+player of Jokic's caliber in raw value" — confirming the guardrail
+reinforces the right behavior rather than just coincidentally matching
+what the model already did.
+
+## Offseason power rankings (`powerrankings.py` + `cogs/offseasonpowerrankings.py`)
+
+**Goal**: same "power rankings" format/branding as the real in-season
+version — gap-based tiers, code-rendered rank list, one short LLM
+paragraph appended below — but usable RIGHT NOW, since the real version
+is blocked until real per-day schedule data exists (season starts
+2026-10-20). This was flagged as the top offseason-buildable idea
+earlier in the project (an "open option, not yet built") and got built
+once trade-grades work surfaced two directly-relevant fixes: the
+`availability_filter` tier on `_build_player_lookup()` (2026-07-14) and
+the earlier `lineup_ceiling()` work for trade grading — this feature
+reuses BOTH almost entirely unchanged.
+
+**Mechanism — reuse, not reinvent.** `compute_offseason_power_rankings(api)`
+(`powerrankings.py`) computes each team's `lineup_ceiling(roster,
+availability_filter="strict")` — their CURRENT roster's optimal-lineup
+value using last season's real per-game production (the STATS view
+already falls back to real last-season numbers pre-season, confirmed
+live for trade grades). `availability_filter="strict"` (not lineup_
+ceiling's own "none" trade-grading default) because this genuinely IS a
+forecast-style use — ranking team STRENGTH, not one player's trade
+value — so real near-term unavailability should still count against a
+team, matching the actual in-season simulation's semantics. Returns the
+exact same tuple shape `compute_power_rankings()` does (`(team, total,
+days, per_day, roster_players)`, with `days=1` since there's no day-by-
+day sum, just a single snapshot) — so `assign_tiers()`/`format_tier_
+list()` work on it completely unchanged, zero special-casing needed. The
+roster_players-building block (previously inlined twice-over) got
+extracted into a shared `_build_roster_players_field()` helper as part
+of this — a real refactor, not just new code; verified no regression in
+`compute_power_rankings()`'s own output afterward.
+
+**Narration is a SEPARATE prompt** (`_OFFSEASON_SYSTEM_PROMPT` /
+`generate_offseason_power_rankings_writeup()`), not a branch in the
+existing one — the framing genuinely differs enough to warrant it:
+explicitly states this is NOT a live simulation, and instructs that
+movement since the last post reflects REAL ROSTER CHANGES (trades/
+waivers) rather than a hot/cold streak, since there are no games being
+played to create one. Deliberately drops two things the real version
+has: records/streaks (every team is 0-0 offseason — zero informational
+value, same reasoning as the pick-owner-record suppression in trade
+grades) and the player-trend block (`compute_player_trends()` would
+always return `[]` here — a player's `gp` can't change between two
+offseason snapshots, so every `recent_fpg` is undefined by construction;
+simpler to not call it than carry an always-empty codepath).
+
+**Verified against real, live data** (not just synthetic): ran the full
+pipeline — computation, gap-based tiers, and a REAL LLM narration call —
+against this league's actual current rosters. Tiers split real and
+meaningfully (Anterior Cruciate Ligaments alone in Favorites, a 7-team
+Contenders logjam, Homoerotic Knights alone In the Hunt, Goat James
+alone in Pancake Contention — real gaps, not arbitrary). Movement
+narration tested with fabricated `previous_ranks` reflecting this
+session's ACTUAL trades (Homoerotic Knights dropped from a fake #2 to
+their real #9 after trading away Kawhi/AD; Goat James from a fake #5 to
+their real #10 after trading away Oso Ighodaro/Khaman Maluach for a
+single 2nd) — the real generation correctly attributed both to "a
+notably thinner roster since the last check-in," never hot/cold-streak
+language, and never leaked a raw number. Also confirmed the no-previous-
+data (first-ever post) case degrades gracefully on its own — the model
+described it as an "inaugural offseason snapshot" without being told to.
+
+**`cogs/offseasonpowerrankings.py`** — built and `DRY_RUN = True` (same
+rollout discipline as every other feature: verify via `/offseasonranks
+debug` first, flip once a human's looked at a real post).
+
+**Scheduling — event-driven, not a fixed interval (2026-07-15, revised
+after user pushback on an initial weekly-Sunday design).** User's
+concern: offseason activity is trade-driven, not calendar-driven, so a
+fixed weekly cadence risks either posting a stale-but-identical list
+during quiet stretches, or (if slowed to monthly instead) leaving a real
+trade unreflected for weeks. Landed on: check DAILY (11am Pacific,
+right after trade grades' 10am check — if a trade shifts the rankings,
+its trade-grade writeup posts first, this "state of the league" ripple-
+effect update follows shortly after), but only actually POST when at
+least one team's rank has genuinely changed since the last post
+(`_ranks_changed()` — compares the freshly computed rank order against
+the persisted `previous_ranks`). Checking is free (pure computation, no
+LLM call); only a post costs anything, and that's gated on real
+movement regardless of check frequency. Measured real cost: $0.0134/post
+— even an unrealistic worst case (a rank-shifting trade landing every
+single day) is ~$0.09/week, trivial either way. `DRY_RUN` mode respects
+the same gate (previews "would post" only when ranks actually changed),
+so a dry run accurately previews real behavior including staying silent
+on a quiet day, not a looser approximation of it. Verified the gate
+directly: no-previous-data returns "changed" (always post the first
+time), identical previous ranks returns "unchanged" (skip), a single
+team's rank differing returns "changed" — all three confirmed against
+real computed rankings.
+
+Own state file (`posted_offseason_power_rankings.json`, gitignored) —
+deliberately SEPARATE from `posted_power_rankings.json`, since these are
+two different ranking mechanisms and their rank histories shouldn't mix
+once the real cog's state resumes from scratch at season start. Same
+"espn" media channel as the real power rankings; visually distinguished
+via title ("📐 Offseason Power Rankings" vs. "📊 Power Rankings"), a
+slightly different embed color (`dark_teal` vs. `teal`), and an explicit
+footer caveat ("Based on current rosters + last season's per-game stats
+— not a live simulation") so it's never mistaken for the real thing.
+`/offseasonrankingsdebug` has NO synthetic-data mode, unlike every other
+tracker's debug command — deliberately: the whole reason this feature
+exists is that real data already works offseason, so there's no "can't
+test until later" gap a synthetic mode would need to paper over.
+
+**Season-start TODO** (add to the checklist at the top of this file once
+the real power rankings goes live): retire or disable this cog — once
+`cogs/powerrankings.py`'s `DRY_RUN` flips to `False` for real, running
+both simultaneously would just be confusing/redundant, not harmful, but
+still worth an explicit decision rather than leaving both running by
+accident.
+
+**Zero-production players (2026-07-15) — confirmed real gap, partially
+fixed.** User asked whether injured/rookie players are handled specially
+in the ranking. They're not, and it's a real problem, not theoretical:
+`lineup_ceiling()` uses last season's `fp_g`, which is exactly 0 for
+anyone who played 0 games last season — indistinguishable in the
+computation from a genuine unproven rookie. Confirmed live: **40
+zero-GP players league-wide**, including real proven stars sidelined by
+injury — Damian Lillard (35), Kyrie Irving (34), Fred VanVleet (32),
+Tyrese Haliburton (26) — valued at literally nothing, same as an
+actual incoming rookie/prospect with zero NBA track record. Age cleanly
+separates the two groups in this league's real data: the four named
+above are the whole "established veteran" cluster; everything else is
+19-24 and matches the actual incoming rookie/prospect pool (recognizable
+names like AJ Dybantsa, Cameron Boozer — genuinely no real NBA
+production to look up).
+
+**Tried the principled fix first, confirmed it's not available.** The
+non-invented option — fall back to a player's last HEALTHY season's real
+stats instead of treating a data gap as "zero" — requires Fantrax's
+season-selector, which does NOT work through this API. Confirmed with
+THREE real attempts against the live `getTeamRosterInfo` endpoint: a
+simple `seasonOrProjectionCode` kwarg, the full structured
+`displayedSeasonOrProjection` object (found via probing
+`displayedLists.seasonOrProjections` in the raw response — a real list
+of 79 selectable season/projection options going back to 2007-08,
+confirmed genuinely exists), and the complete correlated
+`displayedSelections` state a real browser would resend on a dropdown
+change (season code + matching start/end dates + every other selector
+field). All three: response stays locked on the current default season
+regardless. This is now a CONFIRMED dead end, not an assumption — same
+category as the earlier `goBackDays`/windowed-stats investigation.
+
+Also confirmed a replacement-level floor (a legitimate real-data
+technique — WAR/VORP-style baselines, not an invented projection) is the
+right call for genuine rookies/prospects (no real signal to floor
+*against*) but explicitly wrong for the 4 established veterans — flooring
+Lillard at "replacement level" is still a massive understatement of his
+real value, just a less severe one than 0.
+
+**Fix shipped**: `config.manualStatOverrides` — a small, human-curated
+`{player_name: real_fp_g}` dict, explicitly scoped to established
+players the API can't currently value (NOT rookies — replacement-level
+stays the honest default there, nothing to override with in the first
+place). Real numbers sourced by the user directly (e.g., reading them
+off Fantrax's own site UI, which HAS a working season selector — just
+not reachable through this API path) — genuine sourced data, not an
+invented number, same principle as everywhere else in this project.
+`compute_offseason_power_rankings()` applies it: patches in the real
+`fp_g` ONLY when a player shows `gp == 0` exactly, so a stale/forgotten
+entry can't silently override real current production the moment a
+player actually starts playing again.
+
+Caught and fixed a real bug in the first version of this before shipping
+it: patching `fp_g` alone wasn't enough — Lillard and Irving are BOTH
+also sitting on their fantasy team's own "Inj Res" roster SLOT (a
+separate, manager-set exclusion from Fantrax's per-player injury icons),
+which `_build_player_lookup()`'s "strict" filter checks independently
+and would've silently zeroed them right back out even with a real fp_g
+patched in. Fix also patches `status` to `"Active"` for an overridden
+player. Verified this doesn't apply to Haliburton/VanVleet (already
+`status=Active`, no gate to begin with) and confirmed none of the 4 real
+candidates have `Player.out`/`injured_reserve`/`suspended` set (Fantrax's
+OWN icon-based flags, a separate gate this fix does NOT bypass, since the
+real `Player` object's properties can't be mutated from here) — a
+theoretical remaining gap, not a real one for the current candidates.
+Verified with real data before and after the status-patch fix (test
+placeholder numbers at that point): Duck No Smoke (Lillard + Irving)
+moved from 425.45 to 453.44 only after the status fix (was silently
+425.45 → 425.45, unchanged, before it); Slaw Bunnies (Haliburton) moved
+435.93 → 447.95 correctly on the first try; every other team's ranking
+confirmed byte-identical, untouched.
+
+**Real numbers filled in (2026-07-15)**, sourced by the user directly:
+Lillard 44.78, Irving 42.9, Haliburton 47.53, VanVleet 33.02. Re-verified
+with these real values: Anterior Cruciate Ligaments still alone in
+Favorites at #1 (untouched — no override-eligible players), Slaw Bunnies
+(Haliburton) jumps #5→#2, Duck No Smoke (Lillard+Irving) jumps #8→#4,
+Homoerotic Knights (VanVleet) gets a real bump while staying at #9
+(already surrounded by stronger rosters), every other team confirmed
+byte-identical before/after. Full real narration call read correctly —
+no leaked numbers, no confusion from the mid-pack reshuffle.
+
+**Final polish + went live (2026-07-15).** Retitled the embed
+"📐 Offseason Power Rankings **Update**" (was just "...Power Rankings")
+to match the event-driven design — it only ever posts when something
+actually changed, so "Update" is the more accurate name than a generic
+recurring title. Added `role_ids` support to `format_tier_list()`
+(`powerrankings.py`) — an optional `{team_id: discord_role_id}` param
+(kept as an explicit param, not a `config.py` import, matching this
+module's Discord/config-independence) that renders each team as a real
+`<@&role_id>` mention instead of plain text, same convention already
+used by `tradestracker.py`/`tradegrades.py`. Wired in via
+`config.teamRoleIds` for THIS cog only — deliberately not also applied
+to the real `cogs/powerrankings.py`, since that wasn't asked for and
+pinging all 10 teams on every post is a different tradeoff than
+trade grades' 2-teams-at-a-time pings; can extend later if wanted.
+Verified role IDs resolve correctly against real data (spot-checked
+against `config.teamRoleIds` directly, all 10 matched).
+
+`DRY_RUN = False` — user reviewed the real embed (tiers, narration, role
+tags) via `/offseasonrankingsdebug` and confirmed it looks right. No
+backlog-dump concern the way trade grades had (no ID-based dedup to
+pre-seed) — the first real post just establishes the rankings baseline;
+every post after that is gated on genuine rank movement per
+`_ranks_changed()`.

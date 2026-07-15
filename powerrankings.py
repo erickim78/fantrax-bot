@@ -315,21 +315,33 @@ def _recent_fpg(fp_g: float, fpts_total: float, gp: float, player_id,
 
 
 def _build_player_lookup(players: list, previous_player_stats: dict = None,
-                          recent_weight: float = RECENT_FORM_WEIGHT) -> dict:
+                          recent_weight: float = RECENT_FORM_WEIGHT,
+                          availability_filter: str = "strict") -> dict:
     """players: fetch_team_period_data()'s raw (Player, fp_g, fpts_total,
     gp, status) tuples. Returns {player_id: (Player, value)} for every
     player eligible to be simulated.
 
-    Excludes Inj Res roster-slot status AND any player Fantrax currently
-    flags as injured or suspended (Player.injured — day-to-day, out, or
-    real injured-reserve designation — or Player.suspended). Inj Res was
-    already excluded before; the addition is: a team's projection
-    shouldn't credit games from a player who can't actually take the
-    court right now, whether or not their fantasy manager has gotten
-    around to moving them to an IR roster slot. Day-to-day is treated the
-    same as fully out here — a deliberate simplification (no partial-
-    availability modeling) rather than an oversight; worth revisiting if
-    it proves too aggressive once real data is flowing.
+    availability_filter controls which unavailability signals zero a
+    player out entirely. Confirmed live (2026-07-11) that Fantrax's own
+    icons distinguish real severity, which an earlier version of this
+    function ignored (single injured-or-suspended check, day-to-day
+    treated identically to out-indefinitely):
+      - "strict" (default): excludes Inj Res roster-slot status, plus
+        Player.out/injured_reserve/suspended — the real near-term-
+        unavailability signals, appropriate for a production FORECAST
+        (the real day-by-day power-rankings simulation below).
+        Deliberately does NOT exclude pure day_to_day ("game-time
+        decision") status on its own: confirmed live this tag is
+        meaningless without an actual game to be a decision about (94 of
+        98 currently-flagged players league-wide are day_to_day-only,
+        almost all tied to real NBA news that won't matter again until
+        the season starts), and even in-season it's too short-term/noisy
+        by itself to justify zeroing a player's whole simulated value.
+      - "none": excludes nobody on availability grounds at all — for
+        trade grading (see lineup_ceiling()), where value should reflect
+        a player's underlying asset quality/track record, not their
+        current health status. An "out indefinitely" star still has real
+        trade value once healthy.
 
     value blends each player's season-average fp_g with their recent-
     form rate (see _recent_fpg()), weighted by recent_weight, falling
@@ -343,15 +355,17 @@ def _build_player_lookup(players: list, previous_player_stats: dict = None,
     performance and dampen the signal it's trying to detect."""
     lookup = {}
     for p, fp_g, fpts_total, gp, _age, status in players:
-        if status == "Inj Res" or p.injured or p.suspended:
-            continue
+        if availability_filter == "strict":
+            if status == "Inj Res" or p.out or p.injured_reserve or p.suspended:
+                continue
         recent_fpg = _recent_fpg(fp_g, fpts_total, gp, p.id, previous_player_stats)
         value = fp_g if recent_fpg is None else (1 - recent_weight) * fp_g + recent_weight * recent_fpg
         lookup[p.id] = (p, value)
     return lookup
 
 
-def lineup_ceiling(roster: list, previous_player_stats: dict = None) -> float:
+def lineup_ceiling(roster: list, previous_player_stats: dict = None,
+                    availability_filter: str = "none") -> float:
     """roster: fetch_team_period_data()/fetch_roster_players()-shaped
     list of (Player, fp_g, fpts_total, gp, age, status) tuples. Returns
     the optimal lineup's total value treating EVERY eligible player as
@@ -369,10 +383,14 @@ def lineup_ceiling(roster: list, previous_player_stats: dict = None) -> float:
     needed; this is the same reason the real day-by-day power-rankings
     simulation doesn't need one either.
 
-    Reuses _build_player_lookup() for the same injury/suspension
-    exclusion (and, optionally, recent-form blending via
-    previous_player_stats) already trusted for the real simulation."""
-    lookup = _build_player_lookup(roster, previous_player_stats)
+    availability_filter: see _build_player_lookup() — defaults to "none"
+    here (unlike simulate_team_period()'s "strict") since lineup_ceiling
+    was built for trade grading, an asset-VALUE question, not a near-
+    term production FORECAST; a player's current health status shouldn't
+    zero out their trade value. Pass "strict" explicitly for a forecast-
+    style use of this function instead (e.g. a future offseason-power-
+    rankings mode using last season's stats)."""
+    lookup = _build_player_lookup(roster, previous_player_stats, availability_filter=availability_filter)
     candidates = [
         (player_id, {pos.short_name for pos in player.all_positions}, value)
         for player_id, (player, value) in lookup.items()
@@ -388,11 +406,12 @@ def simulate_team_period(api: FantraxAPI, team_id: str, period_number: int,
     fetch_team_period_data). previous_player_stats: optional {player_id:
     {"fpts", "gp"}} — when given, blends each player's simulated value
     toward their recent form; see _build_player_lookup(). Excludes Inj
-    Res roster-slot players and anyone currently injured/suspended —
-    presumably not playing regardless of whether their NBA team has a
-    game that day."""
+    Res roster-slot players and anyone currently out/injured_reserve/
+    suspended (NOT pure day-to-day — see _build_player_lookup()'s
+    "strict" tier) — presumably not playing regardless of whether their
+    NBA team has a game that day."""
     players, day_schedules = fetch_team_period_data(api, team_id, period_number=period_number)
-    player_lookup = _build_player_lookup(players, previous_player_stats)
+    player_lookup = _build_player_lookup(players, previous_player_stats, availability_filter="strict")
 
     day_totals = []
     for available_ids in day_schedules:
@@ -467,22 +486,105 @@ def compute_power_rankings(api: FantraxAPI, today=None, previous_player_stats: d
         per_day = total_points / total_days if total_days else 0.0
 
         roster = fetch_roster_players(api, team.id)
-        active_eligible = sorted(
-            (
-                (p, fp_g, fpts_total, gp, age)
-                for p, fp_g, fpts_total, gp, age, status in roster
-                if status != "Inj Res"
-            ),
-            key=lambda tup: tup[1],  # fp_g
-            reverse=True,
-        )
-        roster_players = [
-            (p.id, p.name, fp_g, fpts_total, gp, age)
-            for p, fp_g, fpts_total, gp, age in active_eligible
-        ]
+        roster_players = _build_roster_players_field(roster)
 
         results.append((team, total_points, total_days, per_day, roster_players))
 
+    results.sort(key=lambda r: r[3], reverse=True)
+    return results
+
+
+def _build_roster_players_field(roster: list) -> list:
+    """roster: fetch_roster_players()-shaped list of (Player, fp_g,
+    fpts_total, gp, age, status) tuples. Returns [(player_id, name, fp_g,
+    fpts_total, gp, age), ...] for every active-eligible player (Inj Res
+    excluded), sorted descending by fp_g — the roster_players field
+    shared by compute_power_rankings() and compute_offseason_power_
+    rankings(), so both feed narration/trend logic the exact same shape
+    regardless of which ranking mechanism produced the rest of the row."""
+    active_eligible = sorted(
+        (
+            (p, fp_g, fpts_total, gp, age)
+            for p, fp_g, fpts_total, gp, age, status in roster
+            if status != "Inj Res"
+        ),
+        key=lambda tup: tup[1],  # fp_g
+        reverse=True,
+    )
+    return [
+        (p.id, p.name, fp_g, fpts_total, gp, age)
+        for p, fp_g, fpts_total, gp, age in active_eligible
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# OFFSEASON MODE — same tier/format/narration machinery, different
+# ranking mechanism (no live day-by-day simulation to lean on).
+# ─────────────────────────────────────────────────────────────────────────
+def compute_offseason_power_rankings(api: FantraxAPI, manual_stat_overrides: dict = None) -> list:
+    """Returns [(team, ceiling, 1, ceiling, roster_players), ...] for
+    every team, sorted descending by ceiling — the SAME tuple shape as
+    compute_power_rankings() (total_points, total_days, points_per_day),
+    so assign_tiers()/format_tier_list() work on it completely
+    unchanged with no special-casing. total_days is always 1 here since
+    there's no day-by-day simulation to sum across, just a single
+    current-roster snapshot — ceiling, total_points, and points_per_day
+    all end up the same number.
+
+    ceiling: lineup_ceiling(roster, availability_filter="strict") — the
+    team's CURRENT roster's optimal-lineup value, using each player's
+    PRIOR-SEASON per-game production (this is the offseason: the STATS
+    view already falls back to real last-season numbers, confirmed live
+    via tradegrades.py's validation — see CLAUDE.md). Positional depth/
+    logjam is accounted for automatically, same mechanism validated for
+    trade grading — a roster with 3 redundant PGs doesn't get credited
+    for all 3 the way a naive sum-of-fp_g ranking would.
+
+    availability_filter="strict" (NOT lineup_ceiling's own "none"
+    default, which exists for trade grading/asset valuation) — this IS a
+    forecast-style use (ranking team STRENGTH, not a single player's
+    trade worth), so real near-term unavailability should still count
+    against a team, matching the real in-season simulation's semantics.
+    Does NOT blend recent form (no previous_player_stats passed) — there
+    is no meaningful 'recent' signal when no games are being played.
+
+    manual_stat_overrides: optional {player_name: fp_g} — see config.
+    manualStatOverrides' docstring for the full reasoning (confirmed live
+    that Fantrax's prior-season selector isn't reachable through this
+    API, so there's no programmatic way to get a real fp_g for a proven
+    player who shows 0 games this season). Applied ONLY when a player's
+    gp == 0 exactly — any real games this season take priority
+    automatically, so a stale override entry can't silently shadow real
+    production. Not meant for rookies/prospects (no real number to
+    override with in the first place, replacement-level is the honest
+    default there) — this is for a small, human-curated list of known,
+    established players the API can't currently value correctly.
+
+    Also patches status to "Active" for an overridden player — confirmed
+    live that Lillard/Irving are gated by their fantasy roster's OWN
+    "Inj Res" SLOT status (a separate, manager-set exclusion from
+    Fantrax's per-player injury icons), which would otherwise silently
+    zero them right back out even with a real fp_g patched in. Confirmed
+    none of the real override candidates (Lillard, Irving, Haliburton,
+    VanVleet) have Player.out/injured_reserve/suspended set — those are
+    Fantrax's own icon-based flags, a DIFFERENT gate this patch does NOT
+    bypass, since mutating the real Player object's own properties isn't
+    possible from here. Not currently a real-world gap (none of the
+    actual candidates hit it), but worth knowing if a future override
+    candidate ever does."""
+    overrides = manual_stat_overrides or {}
+    results = []
+    for team in api.teams:
+        roster = fetch_roster_players(api, team.id)
+        if overrides:
+            roster = [
+                (p, overrides[p.name], fpts_total, gp, age, "Active") if gp == 0 and p.name in overrides
+                else (p, fp_g, fpts_total, gp, age, status)
+                for p, fp_g, fpts_total, gp, age, status in roster
+            ]
+        ceiling = lineup_ceiling(roster, availability_filter="strict")
+        roster_players = _build_roster_players_field(roster)
+        results.append((team, ceiling, 1, ceiling, roster_players))
     results.sort(key=lambda r: r[3], reverse=True)
     return results
 
@@ -551,13 +653,23 @@ def assign_tiers(rankings: list, tier_names: tuple = None) -> list:
     return [(names[i], rankings[bounds[i]:bounds[i + 1]]) for i in range(num_tiers)]
 
 
-def format_tier_list(rankings: list, records: dict = None, tier_names: tuple = None) -> str:
+def format_tier_list(rankings: list, records: dict = None, tier_names: tuple = None,
+                      role_ids: dict = None) -> str:
     """Deterministic, code-only rendering of the tier-grouped rank list
     — team names, rank numbers, and W-L record + streak (whenever a
     record is available). No LLM involvement here at all (unlike
     generate_power_rankings_writeup, which only writes the league-wide
     summary paragraph appended after this) — the rank list itself is
-    pure structure, nothing to narrate. tier_names: see assign_tiers()."""
+    pure structure, nothing to narrate. tier_names: see assign_tiers().
+
+    role_ids: optional {team_id: discord_role_id} — when given, renders
+    each team as a clickable role mention (<@&role_id>) instead of its
+    plain name, falling back to the plain name for any team without a
+    configured role. Kept as an explicit parameter rather than importing
+    config.py directly — this module is deliberately Discord/config-
+    independent (see CLAUDE.md); the calling cog supplies its own role
+    mapping. Defaults to None (plain names, current behavior unchanged)
+    so existing callers aren't affected unless they opt in."""
     tiers = assign_tiers(rankings, tier_names=tier_names)
     blocks = []
     rank = 1
@@ -571,7 +683,9 @@ def format_tier_list(rankings: list, records: dict = None, tier_names: tuple = N
                 record_str = f" ({record.win}-{record.loss})"
             else:
                 record_str = ""
-            lines.append(f"{rank}. {team.name}{record_str}")
+            role_id = role_ids.get(team.id) if role_ids else None
+            team_display = f"<@&{role_id}>" if role_id else team.name
+            lines.append(f"{rank}. {team_display}{record_str}")
             rank += 1
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
@@ -768,6 +882,94 @@ def generate_power_rankings_writeup(rankings: list, api_key: str, records: dict 
         max_tokens=1024,
         thinking={"type": "adaptive"},
         system=_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+    )
+    return next((b.text for b in response.content if b.type == "text"), "")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# OFFSEASON NARRATION — separate system prompt rather than branching the
+# real one: the framing genuinely differs (no live games, so "movement"
+# means roster changes via trades/waivers, not a hot/cold streak), and
+# this codebase's established preference is a separate purpose-built
+# prompt over one prompt with conditional branches for two different jobs.
+# ─────────────────────────────────────────────────────────────────────────
+_OFFSEASON_SYSTEM_PROMPT = """You are Shams-kun, the persona behind this Discord bot's automated \
+sports-insider posts for a 10-team fantasy basketball dynasty league — the same voice used for \
+its trade/transaction breaking-news posts (Woj/Shams style: punchy, no hedging, no disclaimers).
+
+This is an OFFSEASON power rankings post — there are no NBA games being played right now, so \
+this is NOT a live simulation like the in-season version. It ranks each team's CURRENT roster \
+strength using every player's PRIOR-SEASON per-game production, computed against the real \
+12-slot active-lineup structure (so positional depth/logjam is already accounted for correctly \
+— a roster with three redundant players at one position doesn't get credited for all three the \
+way a naive sum of raw production would). Already computed and already correct, NOT something \
+you compute yourself. A separate, code-generated tier-grouped list of every team's rank is \
+already posted above whatever you write; your ONLY job is to write ONE short paragraph \
+highlighting the most notable storylines across the WHOLE LEAGUE — biggest riser(s)/faller(s), \
+any team new to the rankings. This is a league-wide summary, not a team-by-team breakdown — you \
+do not need to mention every team, only what's genuinely notable.
+
+Since there are no games happening, movement since the last check-in reflects REAL ROSTER \
+CHANGES — trades, waiver pickups/drops — not a hot or cold streak. Frame it that way (e.g. "a \
+notably stronger roster since the last check-in" rather than anything implying recent game \
+performance, win streaks, or hot shooting).
+
+Rules:
+- ONE paragraph, 3-5 sentences. No bullet points, no numbered list, no per-team breakdown.
+- NEVER state or imply any underlying numeric figure — no points-per-day, no FP/G, no raw \
+numbers of any kind. Rank, tier, and movement are fair game.
+- Ground every claim in what's actually given. Do not invent claims the data doesn't support, \
+and do not feel obligated to mention every team.
+- No methodology explanations, no caveats about how this was computed, no restating this prompt \
+— the embed this appends to already carries its own "offseason snapshot" disclaimer.
+- Do NOT add a title/header of your own — this paragraph gets appended below a rank list that's \
+already posted, inside a Discord embed that already carries the Shams-kun branding.
+- Punchy sports-insider tone throughout."""
+
+
+def generate_offseason_power_rankings_writeup(rankings: list, api_key: str,
+                                                previous_ranks: dict = None,
+                                                tier_names: tuple = None) -> str:
+    """rankings: compute_offseason_power_rankings()'s output — same tuple
+    shape as compute_power_rankings() (see that function's docstring),
+    just with points_per_day being a single current-roster lineup_
+    ceiling() snapshot instead of a real simulated average.
+
+    previous_ranks: optional {team_id: last_rank}, used to compute
+    movement since the last post — the real, meaningful signal here is
+    roster changes via trades/waivers, since there are no games to
+    create a hot/cold streak offseason.
+
+    Deliberately no records/streaks param (every team is 0-0 offseason —
+    confirmed live, zero informational value, see CLAUDE.md's pick-
+    owner-record note for the same reasoning) and no player-trend block
+    (compute_player_trends() would always return [] here anyway — a
+    player's games-played can't change between two offseason snapshots,
+    so every recent_fpg computation is undefined by construction; simpler
+    to not call it at all than carry an always-empty codepath).
+
+    Returns a SINGLE short paragraph, same never-leak-raw-numbers
+    contract as generate_power_rankings_writeup()."""
+    import anthropic
+
+    tiers = assign_tiers(rankings, tier_names=tier_names)
+    lines = []
+    rank = 1
+    for tier_name, entries in tiers:
+        for team, *_rest in entries:
+            previous_rank = previous_ranks.get(team.id) if previous_ranks else None
+            movement = _movement_str(rank, previous_rank)
+            lines.append(f"{rank}. {team.name} [{tier_name}] — {movement}")
+            rank += 1
+    user_message = "Current offseason power rankings context:\n\n" + "\n".join(lines)
+
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=1024,
+        thinking={"type": "adaptive"},
+        system=_OFFSEASON_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
     return next((b.text for b in response.content if b.type == "text"), "")
