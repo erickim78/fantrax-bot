@@ -52,11 +52,23 @@ RANKINGS_POST_TIME = datetime.time(hour=11, minute=0, tzinfo=_TZ)
 
 # {team_id: rank} from the last time offseason rankings were actually
 # posted (not updated by debug runs). Deliberately a SEPARATE file from
-# posted_power_rankings.json — these are two different ranking
-# mechanisms (lineup_ceiling snapshot vs. real day-by-day simulation),
-# so their rank histories shouldn't be conflated once the season starts
-# and the real cog's state resumes from a blank slate.
+# posted_power_rankings.json — even though both now share the same
+# underlying simulation mechanism (see pr.compute_offseason_power_
+# rankings()'s "UPGRADED" docstring note), they use different
+# availability rules and manual overrides, and this cog's own posting
+# cadence/dedup history is independent of the real cog's — their rank
+# histories shouldn't be conflated once the season starts and the real
+# cog's state resumes from a blank slate.
 RANK_STATE_FILEPATH = Path(__file__).resolve().parent.parent / "posted_offseason_power_rankings.json"
+
+# {player_id: {"name", "fp_g", "team_id"}} from the last time offseason
+# rankings were actually posted (not updated by debug runs). Feeds
+# pr.compute_offseason_movers() — the real, computed reason behind a
+# team's movement (a roster change vs. a value/projection shift for a
+# player who stayed put), so the narration can explain WHY instead of
+# just restating a rank delta. See pr.compute_offseason_movers()'s
+# docstring for the full reasoning.
+PLAYER_VALUE_STATE_FILEPATH = Path(__file__).resolve().parent.parent / "posted_offseason_player_values.json"
 
 
 class OffseasonPowerRankings(commands.Cog):
@@ -79,6 +91,18 @@ class OffseasonPowerRankings(commands.Cog):
         ranks = {team.id: rank for rank, (team, *_rest) in enumerate(rankings, start=1)}
         RANK_STATE_FILEPATH.write_text(json.dumps(ranks))
 
+    def _load_previous_player_values(self) -> dict:
+        if PLAYER_VALUE_STATE_FILEPATH.exists():
+            return json.loads(PLAYER_VALUE_STATE_FILEPATH.read_text())
+        return {}
+
+    def _save_current_player_values(self, rankings):
+        values = {}
+        for team, _total, _days, _per_day, roster_players in rankings:
+            for player_id, name, fp_g, *_rest in roster_players:
+                values[str(player_id)] = {"name": name, "fp_g": fp_g, "team_id": team.id}
+        PLAYER_VALUE_STATE_FILEPATH.write_text(json.dumps(values))
+
     @staticmethod
     def _ranks_changed(rankings, previous_ranks: dict) -> bool:
         """True if at least one team's rank differs from the last real
@@ -95,7 +119,7 @@ class OffseasonPowerRankings(commands.Cog):
         return current_ranks != previous_ranks
 
     # ── core ─────────────────────────────────────────────────────────
-    def _build_embed(self, rankings, previous_ranks: dict = None) -> discord.Embed:
+    def _build_embed(self, rankings, previous_ranks: dict = None, previous_player_values: dict = None) -> discord.Embed:
         # No records/streaks passed to format_tier_list (every team is
         # 0-0 offseason — zero informational value, see CLAUDE.md) and no
         # player-trend block in the narration (see pr.generate_offseason_
@@ -113,7 +137,8 @@ class OffseasonPowerRankings(commands.Cog):
         # only the 2 teams involved in a specific trade.
         tier_list = pr.format_tier_list(rankings, records=None, tier_names=tier_names, role_ids=config.teamRoleIds)
         summary = pr.generate_offseason_power_rankings_writeup(
-            rankings, config.anthropicApiKey, previous_ranks=previous_ranks, tier_names=tier_names,
+            rankings, config.anthropicApiKey, previous_ranks=previous_ranks,
+            previous_player_values=previous_player_values, tier_names=tier_names,
         )
         description = f"{tier_list}\n\n{summary}"
         # dark_teal (not the real power rankings' teal()) — visually
@@ -121,7 +146,26 @@ class OffseasonPowerRankings(commands.Cog):
         # at a glance so the two posts don't get confused with each other.
         embed = discord.Embed(title="📐 Offseason Power Rankings Update", color=discord.Color.dark_teal(), description=description)
         embed.set_author(name="Shams-kun", icon_url=self.bot.user.display_avatar.url)
-        embed.set_footer(text="Based on current rosters + last season's per-game stats — not a live simulation.")
+
+        # Footer caveat reflects whichever data source Fantrax is CURRENTLY
+        # defaulting to — confirmed live (2026-09) that this silently
+        # shifts partway through the offseason from real last-season stats
+        # to Fantrax's own "Projected - Season" (see pr.current_stats_
+        # source()'s docstring). A hardcoded "last season's stats" caveat
+        # would quietly become a false claim the moment that switch
+        # happens; this stays honest either way without needing a manual
+        # flip. Falls back to the pre-switch wording if the detection call
+        # itself fails for any reason — never block the actual post over
+        # a footer string.
+        try:
+            source = pr.current_stats_source(self.api)
+            basis = "Fantrax's preseason projections for the upcoming season" if source["is_projection"] \
+                else "last season's per-game stats"
+        except Exception as e:
+            print(f"[OffseasonPowerRankings] Failed to detect stats source for footer text: {e}")
+            basis = "last season's per-game stats"
+        embed.set_footer(text=f"Based on current rosters + {basis} — not a live simulation.")
+
         embed.timestamp = discord.utils.utcnow()
         return embed
 
@@ -151,10 +195,12 @@ class OffseasonPowerRankings(commands.Cog):
             print(f"[OffseasonPowerRankings] Channel {RANKINGS_CHANNEL_ID} not found.")
             return
 
-        await channel.send(embed=self._build_embed(rankings, previous_ranks))
+        previous_player_values = self._load_previous_player_values()
+        await channel.send(embed=self._build_embed(rankings, previous_ranks, previous_player_values))
         # Only a real post updates the "last check-in" baseline — a debug
         # run must never silently shift what counts as "no change".
         self._save_current_ranks(rankings)
+        self._save_current_player_values(rankings)
 
     # ── background loop ─────────────────────────────────────────────
     @tasks.loop(time=RANKINGS_POST_TIME)
@@ -178,6 +224,7 @@ class OffseasonPowerRankings(commands.Cog):
         await interaction.response.defer()  # the LLM call can take a few seconds
 
         previous_ranks = self._load_previous_ranks()
+        previous_player_values = self._load_previous_player_values()
         try:
             rankings = pr.compute_offseason_power_rankings(self.api, config.manualStatOverrides)
         except Exception as e:
@@ -188,14 +235,21 @@ class OffseasonPowerRankings(commands.Cog):
         # for real (the embed has no numbers, per design), just a
         # diagnostic dump so the underlying computation can be checked.
         lines = [
-            f"{rank}. {team.name} | ceiling={per_day:.2f} "
+            f"{rank}. {team.name} | per_day={per_day:.2f} | days_simulated={days} "
             f"| top_players={', '.join(name for _pid, name, _fp_g, _fpts, _gp, _age in roster_players[:6])}"
-            for rank, (team, _total, _days, per_day, roster_players) in enumerate(rankings, start=1)
+            for rank, (team, _total, days, per_day, roster_players) in enumerate(rankings, start=1)
         ]
+        movers = pr.compute_offseason_movers(rankings, previous_player_values, previous_ranks=previous_ranks)
+        if movers:
+            team_name_by_id = {team.id: team.name for team, *_rest in rankings}
+            lines.append("")
+            lines.append("Movers (why the biggest rank changes happened):")
+            for team_id, info in movers.items():
+                lines.append(f"  {team_name_by_id.get(team_id, '?')}: {info}")
         text = "\n".join(lines)
         await interaction.followup.send(f"```\n{text[:1900]}\n```")
 
-        await interaction.followup.send(embed=self._build_embed(rankings, previous_ranks))
+        await interaction.followup.send(embed=self._build_embed(rankings, previous_ranks, previous_player_values))
 
 
 async def setup(bot):

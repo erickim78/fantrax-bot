@@ -17,8 +17,8 @@ further down — this is just the actionable summary.
       `/rankingsdebug` (non-synthetic) and confirm:
   - `SCHEDULE_FULL` is actually returning real day-by-day columns (not
     still falling back to season-totals — gotcha #12)
-  - Gap-based tier boundaries (`👑 Favorites` / `🏆 Contenders` / `⚔️ In
-    the Hunt` / bottom tier) look like reasonable groupings of the real
+  - Gap-based tier boundaries (`👑 Favorites` / `🏆 Contenders` / `🎲 Long
+    Shots` / bottom tier) look like reasonable groupings of the real
     `points_per_day` spread, not a degenerate split
   - `config.lastPlaceTierName` still reflects this season's actual
     last-place punishment (update it if not — it's a config value, no
@@ -718,6 +718,24 @@ this whole feature family, unlike re-simulating a past `SCHEDULE_FULL`
 period against today's roster (the "before/current/after" idea considered
 and rejected earlier for power rankings, for exactly this contamination
 reason).
+
+**Still on the list, still deliberately deferred (confirmed 2026-09-17)**
+— user asked directly whether this ever got built; it hasn't, same
+reasoning as above still holds (needs a real, COMPLETED week — both what
+a manager actually started and the real final box scores — neither
+exists pre-season). Worth revisiting once Week 1 actually concludes,
+not before. The infrastructure risk is largely already retired by
+everything else built this session: `solve_daily_lineup()` (the min-
+cost-flow optimal-lineup solver) has been proven out repeatedly across
+trade grades and both power-rankings variants, and real day-by-day
+NBA schedule data — the other missing piece — turned out to already
+exist pre-season (see the "Real day-by-day schedule data now exists"
+section). The remaining open question is still specifically
+`getLiveScoringStats`'s real per-DAY date-scoping (confirmed working for
+daily top performer's ACTIVE/RESERVE bucket parsing logic, but the
+scoring_date parameter itself was never verified to actually scope
+correctly since every pre-season test date echoed back the same
+default) — that's a Week 1 verification, not something buildable now.
 
 **`cogs/dailytopperformer.py`** — built and DRY_RUN=True (new,
 unverified-against-real-data feature; flip once you've watched it run for
@@ -1519,3 +1537,353 @@ backlog-dump concern the way trade grades had (no ID-based dedup to
 pre-seed) — the first real post just establishes the rankings baseline;
 every post after that is gated on genuine rank movement per
 `_ranks_changed()`.
+
+**Real bug found from the first live post (2026-07-16): Inj Res roster-
+SLOT ≠ real injury status.** User asked why theBaiker landed 8th and
+asked for a full breakdown. Real answer: 426.48 was correct GIVEN the
+"strict" availability tier's rules, but the breakdown surfaced something
+those rules were getting wrong — 4 of theBaiker's players were zeroed
+out because they're sitting on the fantasy team's own Inj Res roster
+SLOT, and one of them (Lauri Markkanen, 42.05 fp/g over 42 real games)
+has ZERO real injury flag from Fantrax at all (`Player.injured_reserve
+== False`). These are two genuinely separate signals that "strict" had
+been conflating: `status == "Inj Res"` is a fantasy MANAGER's roster-
+slot placement (often just used to free up an Active/Reserve spot, since
+Inj Res slots don't count against those caps) — completely different
+from `Player.injured_reserve`, Fantrax's own real "this player is
+actually on the NBA team's injured list" designation. User's framing:
+for the offseason ranking, don't discount purely on roster-slot
+placement — base it on real status only.
+
+Added a THIRD `availability_filter` tier to `_build_player_lookup()`
+(`powerrankings.py`): `"offseason"` — excludes real `out`/
+`injured_reserve`/`suspended`, but NOT the `Inj Res` roster-slot status
+(unlike `"strict"`, which still correctly excludes it for the real day-
+by-day FORECAST, where near-term unavailability should count regardless
+of *why* a manager parked someone on IR). Also threaded through
+`_build_roster_players_field()` (new `exclude_inj_res_slot` param) so
+the narration/debug-context roster list stays consistent with what
+actually counts toward the ceiling. `compute_offseason_power_rankings()`
+switched from `"strict"`/`exclude_inj_res_slot=True` to `"offseason"`/
+`exclude_inj_res_slot=False`.
+
+Caught and fixed a real bug in my own first edit before it shipped: a
+leftover duplicate `if status != "Inj Res"` line in the generator
+expression, which would have silently ANDed against the new opt-out
+flag and defeated the whole fix. Caught by reading the diff back before
+verifying, not by a failed test — worth remembering to re-read generator/
+comprehension edits closely, they don't always fail loudly.
+
+Verified against real, live data — turned out much bigger than the
+single Markkanen case that prompted it: **9 of 10 teams** had at least
+one player sitting on Inj Res with no real injury flag (mostly
+`day_to_day`-only, the same noisy/stale tag already established as
+meaningless without a live game — see the earlier day_to_day fix), many
+with substantial real samples (Kevin Porter 42.05/38 GP, Ryan Rollins
+36.53/74 GP, DeMar DeRozan 32.21/77 GP). Full rankings shifted
+meaningfully: theBaiker jumped **8th → 2nd** (426.48 → 459.62 — Markkanen
++ Sarr + Edey all newly counted), and 6 of 10 teams' ceilings changed.
+This will trigger a real post on the next scheduled check (11am
+Pacific) — correctly so, since `_ranks_changed()` comparing against the
+old (methodologically wrong) baseline is exactly the kind of genuine,
+warranted correction that gate exists to surface, not a false alarm.
+
+**Bigger discovery (2026-09-17): Fantrax's default STATS view silently
+switched from real last-season stats to projections.** User noticed a
+real post with big swings and "no moves were really made" — investigated
+and found the underlying DATA SOURCE itself had changed, not any code
+bug. `displayedSelections.displayedSeasonOrProjection` (the same field
+investigated back in July for the failed season-selector attempts) had
+silently flipped from `"2025-26 Reg Season - YTD"` (real, verified last-
+season stats — what this whole feature, and tradegrades.py, were
+originally built/verified against) to `"Projected - Season"` — an opaque
+third-party projection for the UPCOMING 2026-27 season. Confirmed with a
+real player: Shai Gilgeous-Alexander showed fp_g=55.49/68 real games in
+July, now shows fp_g=55.42 over a suspiciously round "70" games — and
+previously-zero-GP players (real injured vets, real rookies) now show
+full non-zero projected lines. This is NOT something this codebase
+controls or chose — Fantrax's own default just transitions at some point
+during the offseason, presumably once real preseason projections become
+available, and per 3 separate confirmed-failed attempts (see the earlier
+season-selector investigation), there's no way to force one or the
+other through this API.
+
+**Concrete, immediate side effect found**: the manual-override mechanism
+(`config.manualStatOverrides` — Lillard/Irving/Haliburton/VanVleet) is
+now silently INACTIVE. It only applies when `gp == 0`, and Fantrax's
+projection system now assigns all four of them non-zero projected games
+(e.g. Lillard: fp_g=30.4/50 "games" now, vs. the real 44.78 the user
+sourced) — so the override never fires anymore, and the system is quietly
+using Fantrax's own (notably lower, for Lillard) projection instead.
+**Resolved, no code change needed**: user confirmed this dormancy is
+correct, not a regression to fix — the whole point of the manual
+override was always to give injured/zero-GP players a real, sourced
+number instead of a false zero; now that Fantrax's own projections do
+that job organically (whenever they're the active data source), the
+override mechanism SHOULD sit dormant. It stays in `config.py` as a
+safety net for the early-offseason real-YTD phase (right after a season
+ends, before Fantrax's projections come online next cycle) — this
+current dormancy is the mechanism doing exactly what it was designed to
+do, not a bug.
+
+**Also affects trade grades**, not just offseason power rankings — both
+pull rosters via the same `fetch_team_period_data()`/`get_team_roster_
+info` path with no season pinned, so `analyze_trade()`'s marginal-value
+computation is now silently running on projections too, not the real
+last-season stats it was built and validated against (the Kawhi/AD
++25.3/-25.2 validation, the Jokic-for-one-pick guardrail test — all of
+that was against real stats, pre-switch). User confirmed this is fine —
+no action taken. Worth remembering if trade-grade output ever looks off
+going forward: the ground truth it's reasoning from is now a projection,
+not a verified historical number.
+
+**Fix shipped (this session): honest, self-updating labeling — not a
+forced data source.** User's call: "I don't mind using the projections"
+— and there's no actual GAP in availability to design around; Fantrax's
+default is always either real-YTD or projected, one or the other, at
+every point in the offseason. So the fix isn't picking a side — it's
+making the embed's caveat text stay TRUE regardless of which one is
+currently active, since a hardcoded "last season's stats" claim silently
+becomes false the moment Fantrax's own switch happens.
+
+New `pr.current_stats_source(api)` (`powerrankings.py`): one lightweight
+extra API call (any single team, once per check — negligible cost) that
+reads `timeframeTypeCode` (`"YEAR_TO_DATE"` vs `"PROJECTED_SEASON"` —
+chosen over pattern-matching the `code` field, which embeds internal IDs
+like "41n" that likely shift every year) and returns whether the CURRENT
+default is a projection. `cogs/offseasonpowerrankings.py`'s `_build_embed()`
+uses this to pick the footer wording dynamically ("last season's per-game
+stats" vs "Fantrax's preseason projections for the upcoming season"),
+wrapped in a try/except that falls back to the pre-switch wording rather
+than ever blocking a real post over a footer string. Verified against
+real, live (currently-projection) data: detection correctly reports
+`is_projection=True`, footer text builds correctly.
+
+## Real day-by-day schedule data now exists — and a real double-counting
+## bug found and fixed in the REAL power rankings (2026-09-17)
+
+User asked whether the offseason power rankings accounts for real
+schedule depth (not every player has a game every night) — answer at
+the time: no, `lineup_ceiling()` deliberately assumes everyone could
+play, a best-case ceiling, because real day-by-day schedule data
+(`SCHEDULE_FULL`) genuinely didn't exist pre-season (confirmed back in
+July). User asked if there's any way to simulate this properly — re-
+verified rather than assuming the July finding still held, since ~2
+months had passed and the real NBA schedule is normally published in
+August.
+
+**It's changed.** `SCHEDULE_FULL` now returns real per-player, per-date
+game data — confirmed live: Darius Garland, Jamal Murray, Cooper Flagg
+etc. each showing their own distinct real game dates through Oct 20 –
+Nov 19. This is the exact data `simulate_team_period()` (the REAL day-
+by-day power-rankings simulation, `cogs/powerrankings.py`, sitting in
+`DRY_RUN=True` since this was built) has been blocked on this whole
+time.
+
+**But found a real bug investigating it, not just good news.**
+`period_number` — the parameter `staggered_period_numbers()` used to
+request two distinct, non-adjacent weeks (the original "decorrelate one
+team's schedule-density luck from another's" design) — turned out to
+have ZERO effect on what SCHEDULE_FULL actually returns. Tested
+period=1, 3, 10, and 19: byte-identical date range every time (Oct 20 –
+Nov 19, a fixed ~30-day window). The value IS echoed back in the
+response's `displayedSelections.displayedPeriod` field, exactly the way
+a correctly-applied filter would look at a glance — but doesn't actually
+scope the data server-side. Same category of bug as the STATS view's
+season-selector investigation from earlier (`displayedSeasonOrProjection`):
+a parameter that LOOKS respected in the echoed selector state without
+actually being applied.
+
+Practical effect this had been silently causing: `compute_power_rankings()`
+requesting "period_a" and "period_b" was fetching and simulating the
+EXACT SAME ~30 real days TWICE and summing them — not a crash, not
+obviously-wrong output (`points_per_day` still landed in a sane range,
+since both `total_points` and `total_days` were inflated by the same 2x
+factor and canceled out in the average), which is exactly why this
+could have shipped and looked fine without the deeper check. Verified
+precisely: `total_points` for Anterior Cruciate Ligaments was 19975.88
+across `days=60` before the fix, 9987.94 across `days=30` after —
+exactly halved, `per_day` byte-identical (332.93) both times, confirming
+the bug was real but self-canceling in the one number anyone would have
+looked at.
+
+**Fix**: replaced the two-period stagger with a single request, using
+every date column that naturally comes back — `_upcoming_period_number()`
+(renamed from `staggered_period_numbers()`) now returns ONE period
+number, still passed through to `fetch_team_period_data()` in case real
+per-period scoping starts working once the season is actually live
+(genuinely unverifiable until then), but `compute_power_rankings()` no
+longer assumes two different period numbers yield two different
+windows. The wider ~30-day single window arguably serves the original
+"decorrelate schedule-density noise" goal even better than the old
+2×7-day stitched-together design did, since a full month naturally
+smooths out single-week anomalies more than two small samples would.
+
+Updated `fetch_team_period_data()`'s docstring, which previously
+asserted (accurately, in July) that day-by-day data was "UNTESTABLE
+until the season starts" — that claim is now stale and was corrected in
+place, along with documenting the period_number-doesn't-scope-anything
+finding directly where a future reader would look for it.
+
+**Not yet decided**: whether to actually flip `DRY_RUN=False` on the
+real `cogs/powerrankings.py` now that its core blocker (real schedule
+data) has partially resolved ahead of the Oct 20 season start. The
+underlying simulation is now verified working correctly on real data —
+but per-period scoping still doesn't work as designed, the fp_g source
+is currently Fantrax's projections (not real in-season stats, see
+above), and `/rankingsdebug` (non-synthetic) hasn't been run against
+this fixed version yet. Worth a real test pass before considering
+turning it on for real.
+
+**Ran that test pass** — real `/rankingsdebug`-equivalent output looked
+right: real tiers, real (honest) 0-0 records, correct "inaugural post"
+framing in the narration, and the overall shape roughly matched the
+offseason rankings (same top cluster, Homoerotic Knights near the
+bottom in both) — not identical, expected, since one accounts for real
+schedule/depth and the other didn't yet at that point. Still left
+`DRY_RUN=True` — showing output isn't the same as deciding to ship it.
+
+## Offseason power rankings upgraded to the real schedule-aware simulation (2026-09-17, same session)
+
+User's follow-up: now that real day-by-day schedule data exists, does
+the offseason ranking use it too? No — it was still on `lineup_ceiling()`
+(the "everyone could play" ceiling), untouched by the bug fix above.
+User's reasoning for upgrading it: rosters here run ~30 deep, and
+`lineup_ceiling()` only ever credits whichever 12 players could
+theoretically fill the active slots if everyone had a game the same
+day — the other 18+ real rostered players are completely invisible to
+the ranking regardless of actual bench quality. Wanted the real
+simulation instead, same mechanism the in-season version has always
+used, so real depth actually counts.
+
+**Threaded two new parameters into `simulate_team_period()`**
+(previously hardcoded to `availability_filter="strict"`, no override
+support): `availability_filter` (so the offseason path can pass
+`"offseason"` instead of `"strict"` — same roster-slot-vs-real-status
+distinction as before, just now applied inside the real simulation
+instead of `lineup_ceiling()`) and `manual_stat_overrides` (applied the
+same way it always was — patches fp_g + status for any `gp == 0` player
+whose name is in `config.manualStatOverrides`, now happening inside the
+day-by-day simulation instead of before a single `lineup_ceiling()`
+call).
+
+**Rewrote `compute_offseason_power_rankings()`** to call
+`simulate_team_period()` (via `_upcoming_period_number()`, the same
+single-window helper `compute_power_rankings()` uses) instead of
+`lineup_ceiling()`. `total_days` now reflects the real simulated day
+count (~30) instead of a hardcoded `1`. `roster_players` (the narration/
+debug-dump display field) still gets the override patch applied
+separately — it comes from its own `fetch_roster_players()` call for
+display purposes, not from inside the simulation, so it needs its own
+consistency patch to keep showing the same values the ranking actually
+used.
+
+**Verified against real data**, including a clean internal-consistency
+check: IHOP Dreams (no override-eligible or Inj-Res-slot-only players
+on their roster) came out **byte-identical** between the old
+strict-mode real in-season number and the new offseason number
+(313.15, exactly) — confirming both paths now genuinely share the same
+simulation core and only diverge where they're supposed to. Every team
+WITH an affected player (theBaiker, Duck No Smoke, Goat James,
+Homoerotic Knights) moved up appropriately vs. the old ceiling-based
+numbers. Full pipeline re-verified end to end: real tiers, real role
+tags, real narration — reads correctly, no leaked numbers, no
+regressions from the swap.
+
+`lineup_ceiling()` itself is untouched and still used exactly as before
+by `tradegrades.py` (asset valuation is a genuinely different question
+from team-strength ranking — that reasoning didn't change) — its
+docstring's stale forward-reference to "a future offseason-power-
+rankings mode" was updated to reflect what actually happened instead.
+
+## Offseason power rankings narration now explains WHY, not just rank deltas (2026-09-17, same session)
+
+Direct follow-up to a real thing that just happened: a post went out
+with a real rank swing and no actual roster moves (see the "so whyd it
+post today" thread above) — the narration at the time could only see
+rank deltas and was instructed to assume movement meant a roster change,
+which we now know isn't always true (Fantrax's own projections shift on
+their own). User's ask: highlight WHY moves happened, and only the big
+movers need detailed treatment — everyone else can stay brief.
+
+**Why this needed real grounding, not just a prompt tweak**: asking
+Claude to explain "why" off a bare rank number risks it inventing a
+plausible-sounding but FALSE reason (implying a trade that never
+happened) — exactly the failure mode this whole project has consistently
+built around avoiding. Needed to give it the REAL, computed cause.
+
+**New `compute_offseason_movers()`** (`powerrankings.py`): tracks each
+player's value AND which team they're on between snapshots (not just
+value — team_id is what makes this work). For the biggest-moving teams
+(top N by |rank delta|, matching the existing risers/fallers convention
+already used for player trends), computes three real, distinguishable
+things:
+- **gained**: a player newly on the roster. If they were tracked on a
+  DIFFERENT team last snapshot → a real trade/waiver move, reported
+  with the real source team name. If they weren't tracked at all before
+  → a genuine new pickup (a free agent nobody had rostered).
+- **lost**: a player who was on the roster last snapshot but isn't now
+  — reported with their real destination team if findable on another
+  current roster, or "dropped" if not.
+- **shifted**: a player who stayed on the SAME roster both snapshots,
+  but whose value changed — explicitly NOT a roster move, a value/
+  projection change (real-world injury news, or Fantrax's projection
+  system recalculating on its own). Capped at the top 2 by |delta| per
+  team; sub-1.0 fp_g shifts are dropped as noise.
+
+Teams without a real driver (most of them, most of the time) get no
+detailed entry at all — the system prompt explicitly instructs Claude
+not to guess a reason for these, just state rank/tier plainly.
+
+**New state file** `posted_offseason_player_values.json`
+(`{player_id: {"name", "fp_g", "team_id"}}`, gitignored, same full-
+overwrite-on-save pattern as every other state file in this project) —
+separate from the rank-only state file, saved only on a real post, same
+"debug runs never touch persisted state" principle as everywhere else.
+
+**Rewrote `_OFFSEASON_SYSTEM_PROMPT`** to stop asserting movement always
+means a roster change (that was factually wrong, per the "no moves were
+really made" incident) — now explicitly tells Claude there are two real,
+different causes (roster move vs. value shift), to use the given driver
+context to know which one actually happened, and to never default to
+"made a move" language when the context says otherwise. Added an
+explicit rule against inventing a reason when no driver context is
+given for a team.
+
+**Verified against real data**, including a constructed realistic
+scenario (a real player "traded" between two real teams + a real
+player's value shifted while staying put, layered onto this league's
+actual current rosters): `compute_offseason_movers()` correctly
+distinguished the trade from the value shift, attributed the trade
+symmetrically (gained/lost with real team names on both sides, not just
+one-sided), and didn't double-count the traded player as also
+"shifted." Real narration call correctly explained both — "despite
+shipping Victor Wembanyama to Yard House Spinach Dips — a surging
+Donovan Mitchell more than covered the loss" — while every team without
+driver context got a brief, honest "holds serve" mention instead of
+invented reasoning.
+
+## Tier rename: "In the Hunt" → "Long Shots" (2026-09-18)
+
+User found "⚔️ In the Hunt" odd as the third tier: it means "still in the
+race," so it read as *higher* than "Contenders" despite sitting below it
+— two near-synonyms in the wrong order. Checked the real gap structure
+before deciding anything: gaps were 28 (Homoerotic Knights → #9) and 17
+(Anterior Cruciate Ligaments → #2), then a third split of only ~9,
+barely larger than the ~8 gap *inside* the Contenders cluster (#2-#8).
+So "everyone's a Contender" was accurate, and the third-tier split was
+`assign_tiers()` filling its N-1 quota rather than a real separation —
+it always makes exactly N-1 splits at the largest gaps whether or not
+they're meaningful. Considered dropping to 3 tiers for a 10-team league
+(the data only really supports two splits), but user preferred keeping
+four and just renaming.
+
+Changed `TIER_NAMES`' third entry to `🎲 Long Shots`, which reads
+unambiguously below Contenders. Kept `👑 Favorites`, `🏆 Contenders`
+(accurate, neutral name for a crowded middle), and the config-driven
+`🥞 Pancake Contention`. `TIER_NAMES` is shared, so this applies to both
+the offseason and real in-season power rankings; the season-start
+checklist line was updated to match. Older dated entries above still say
+"In the Hunt" — left as-is, they're history. Worth revisiting the tier
+count in-season, when real results should spread teams out more than the
+offseason projections do.

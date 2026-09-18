@@ -182,24 +182,46 @@ def fetch_team_period_data(api: FantraxAPI, team_id: str, period_number: int = N
     power-rankings projection itself, just riding along on the same
     already-fetched row.
 
-    day_schedules: list of sets, one set per date column in the
-    requested period, each containing the player_ids with a game that
-    day. Built by matching STATS rows to SCHEDULE_FULL rows position-by-
-    position, same zip-based approach fantraxapi's own Roster.__init__
-    uses internally.
+    day_schedules: list of sets, one set per date column in whatever
+    window SCHEDULE_FULL actually returns (see below — NOT necessarily
+    scoped to just `period_number`), each containing the player_ids with
+    a game that day. Built by matching STATS rows to SCHEDULE_FULL rows
+    position-by-position, same zip-based approach fantraxapi's own
+    Roster.__init__ uses internally.
 
-    NOTE: day_schedules is UNTESTABLE until the season starts — confirmed
-    live (including with an explicit future period_number) that
-    SCHEDULE_FULL only returns season-total columns (Age/FPts/FP-G), not
-    per-date columns, until daily scoring periods actually exist. Until
-    then this returns an empty list per team, not a crash — callers
-    should treat "no day_schedules" as "nothing to simulate yet", not an
-    error. Separately confirmed live that passing a raw "goBackDays" param
-    (mirroring the site's window-selector UI) has no effect on the STATS
-    view either — Fantrax's real windowed-stats mechanism needs a
-    structured "displayedSeasonOrProjection" selector this thin Method
-    wrapper isn't built to send, so fp_g/fpts_total/gp are always the
-    season-to-date view regardless of period_number.
+    UPDATED (2026-09-17, supersedes an earlier "untestable until the
+    season starts" note): confirmed live that SCHEDULE_FULL now DOES
+    return real per-date columns pre-season — real per-player, per-date
+    game data going out roughly a month (e.g. confirmed live: Oct 20
+    through Nov 19 as of today). This flips only once the calendar gets
+    close enough to the season for Fantrax to have published real
+    schedule data; before that point it genuinely still returns only
+    season-total columns (Age/FPts/FP-G), same empty-list-not-a-crash
+    behavior as before — still no callable way to distinguish "too early
+    in the offseason" from "no games this specific day" other than an
+    empty day_schedules list either way.
+
+    IMPORTANT: confirmed live that `period_number` does NOT scope which
+    date columns come back right now — periods 1, 3, 10, and 19 all
+    return the byte-identical ~30-day window. It's echoed back in the
+    response's displayedSelections.displayedPeriod field without
+    actually filtering anything server-side (same pattern already
+    confirmed for the STATS view's season selector below). Whether real
+    per-period scoping starts working once the season is actually live
+    is genuinely unverifiable until that happens. compute_power_rankings()
+    already accounts for this — see its module-level note — by making a
+    single request and using every date column that comes back, rather
+    than assuming distinct period_number values yield distinct windows.
+
+    Separately confirmed live that the STATS view's fp_g/fpts_total/gp
+    columns silently transition over the course of the offseason from
+    real last-completed-season stats to Fantrax's own "Projected -
+    Season" values (an opaque third-party projection) — see
+    current_stats_source() and CLAUDE.md's write-up. Also still true:
+    passing a raw "goBackDays" param (mirroring the site's window-
+    selector UI) has no effect on the STATS view — the real windowed-
+    stats mechanism needs the same kind of structured selector object
+    that doesn't respond to simple params through this API path.
     """
     responses = fantrax_api_module.get_team_roster_info(api, team_id, period_number=period_number)
     stats_resp, sched_resp = responses
@@ -254,31 +276,94 @@ def fetch_roster_players(api: FantraxAPI, team_id: str) -> list:
     return players
 
 
+def current_stats_source(api: FantraxAPI) -> dict:
+    """Returns {"is_projection": bool, "label": str} describing whatever
+    season/projection view the STATS endpoint is CURRENTLY defaulting to.
+
+    Confirmed live that this default silently shifts over the course of
+    the offseason — real last-season "...Reg Season - YTD" stats right
+    after the season ends (verified 2026-07: e.g. Shai Gilgeous-
+    Alexander fp_g=55.49 over 68 real games — this is what tradegrades.py
+    and the offseason power rankings were originally built/verified
+    against), switching at some point to "Projected - Season" — an
+    opaque third-party projection for the UPCOMING season (confirmed
+    2026-09: same player showing fp_g=55.42 over a suspiciously round
+    gp=70, and previously-zero-GP rookies/injured vets suddenly showing
+    full projected lines). Fantrax controls exactly when that switch
+    happens, not this codebase — and per 3 separate confirmed-failed
+    attempts (see CLAUDE.md), there's no way to force one or the other
+    through this API. There's no gap where NEITHER is available — the
+    default is always one or the other, so no code change is needed to
+    "ride" the transition; the only thing that goes stale without this
+    detection is any hardcoded "based on last season's stats" caveat
+    text, which becomes a false claim the moment the switch happens.
+
+    Detects via timeframeTypeCode ("YEAR_TO_DATE" vs "PROJECTED_SEASON")
+    rather than pattern-matching the "code" field, which embeds internal
+    IDs (e.g. "41n") that likely shift every year. Makes one lightweight
+    extra API call (any single team's roster info) — negligible given
+    this is only ever called once per check cycle, not per-team."""
+    any_team_id = next(iter(api.teams)).id
+    responses = fantrax_api_module.get_team_roster_info(api, any_team_id, period_number=None)
+    stats_resp = responses[0]
+    selection = stats_resp["displayedSelections"]["displayedSeasonOrProjection"]
+    return {
+        "is_projection": selection.get("timeframeTypeCode") == "PROJECTED_SEASON",
+        "label": selection.get("name", "unknown"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # WINDOW SELECTION & SIMULATION
 # ─────────────────────────────────────────────────────────────────────────
-# Staggered two-week design (not one continuous 14-day block): NBA
-# schedule density isn't independent week-to-week for a given team — road
-# trips, back-to-back clusters, and rest patterns run in multi-week
-# phases, so a continuous block can land entirely inside one team's light
-# or heavy stretch. Two non-adjacent weeks (skip one in between) decorrelate
-# that noise at the same total simulated-day count, while staying close
-# enough to "now" (~3 weeks out) to keep injuries/recent roster moves
-# relevant — see conversation history for the full reasoning.
-def staggered_period_numbers(api: FantraxAPI, today) -> tuple:
-    """Returns (period_a, period_b): the period containing/after today,
-    and a period 2 further out (skipping one in between). Either may be
-    None if there aren't enough remaining periods in the season."""
+# Single-window design (NOT the originally-planned staggered two-week
+# design — see the superseded rationale this replaced, below the
+# history note). This was ORIGINALLY built as two non-adjacent weeks (skip
+# one in between) via two separate SCHEDULE_FULL requests with different
+# period_number values, specifically to decorrelate one team's schedule-
+# density luck (back-to-back clusters, road trips run in multi-week
+# phases) from another's.
+#
+# CONFIRMED LIVE (2026-09-17) that this design was silently broken: the
+# `period` parameter sent to getTeamRosterInfo(view="SCHEDULE_FULL") is
+# ECHOED BACK in the response's displayedSelections.displayedPeriod
+# field, but does NOT actually scope which date columns come back —
+# tested period=1, 3, 10, and 19 and got the byte-identical date range
+# every time (Oct 20 – Nov 19, a fixed ~30-day window). Same client-
+# echoed-without-server-effect pattern already confirmed for the STATS
+# view's displayedSeasonOrProjection selector (see CLAUDE.md's season-
+# selector investigation) — a parameter the UI clearly uses for
+# server-side filtering somewhere is either not wired the same way
+# through this raw API path, or genuinely doesn't apply until the
+# season is actually live and there's a real "current period" for the
+# server to reason about relative offsets from (untestable until then).
+#
+# Practical effect: requesting "period_a" and "period_b" was silently
+# fetching and simulating the EXACT SAME ~30 real days twice and summing
+# them — not a crash, not obviously-wrong-looking output (points_per_day
+# still landed in a sane range, since both total_points and total_days
+# were inflated by the same 2x factor), but not what the two-request
+# design claimed to be doing, and wasted an API call. Fixed by making a
+# SINGLE request and using every date column that naturally comes back —
+# which, at ~30 days, already covers a wider and more representative
+# window than the original 2×7-day stagger was reaching for, so the
+# "decorrelate schedule luck" goal is still met, just via a bigger single
+# sample instead of two small stitched-together ones. period_number is
+# still passed through (rather than removed) in case real per-period
+# scoping starts working correctly once the season is actually live —
+# genuinely unverifiable until that happens, same as several other
+# pre-season assumptions in this file.
+def _upcoming_period_number(api: FantraxAPI, today):
+    """Returns the scoring period number containing or immediately after
+    today, or None if there are no remaining periods this season. See
+    the module-level note above for why this is passed through to
+    fetch_team_period_data()/simulate_team_period() despite not
+    currently affecting what SCHEDULE_FULL returns."""
     upcoming = sorted(
         (sp for sp in api.scoring_periods.values() if sp.end >= today),
         key=lambda sp: sp.start,
     )
-    if not upcoming:
-        return None, None
-    period_a = upcoming[0].number
-    later = [sp.number for sp in upcoming if sp.number >= period_a + 2]
-    period_b = later[0] if later else None
-    return period_a, period_b
+    return upcoming[0].number if upcoming else None
 
 
 # Recent-form blending — how much a player's simulated value leans on
@@ -342,6 +427,24 @@ def _build_player_lookup(players: list, previous_player_stats: dict = None,
         a player's underlying asset quality/track record, not their
         current health status. An "out indefinitely" star still has real
         trade value once healthy.
+      - "offseason" (added 2026-07-16): excludes Player.out/injured_
+        reserve/suspended — Fantrax's own REAL status designations —
+        but deliberately does NOT exclude on status == "Inj Res", unlike
+        "strict". Confirmed live this matters: "Inj Res" is a FANTASY
+        roster-SLOT placement the manager chooses (often just to free up
+        an Active/Reserve spot, since Inj Res slots don't count against
+        those caps) — a completely separate signal from Player.
+        injured_reserve, Fantrax's own real "this player is actually on
+        the NBA team's injured list" flag. Found a real case: a player
+        sitting on his fantasy team's Inj Res slot with
+        Player.injured_reserve == False (Fantrax itself doesn't
+        currently flag him injured at all) — being zeroed out purely by
+        a roster-management choice, not any real signal about his
+        actual status heading into next season. Used by
+        compute_offseason_power_rankings() instead of "strict" for
+        exactly this reason — that ranking should reflect a player's
+        actual real-world status, not how their fantasy manager happens
+        to be using roster slots for cap-space reasons.
 
     value blends each player's season-average fp_g with their recent-
     form rate (see _recent_fpg()), weighted by recent_weight, falling
@@ -357,6 +460,9 @@ def _build_player_lookup(players: list, previous_player_stats: dict = None,
     for p, fp_g, fpts_total, gp, _age, status in players:
         if availability_filter == "strict":
             if status == "Inj Res" or p.out or p.injured_reserve or p.suspended:
+                continue
+        elif availability_filter == "offseason":
+            if p.out or p.injured_reserve or p.suspended:
                 continue
         recent_fpg = _recent_fpg(fp_g, fpts_total, gp, p.id, previous_player_stats)
         value = fp_g if recent_fpg is None else (1 - recent_weight) * fp_g + recent_weight * recent_fpg
@@ -387,9 +493,13 @@ def lineup_ceiling(roster: list, previous_player_stats: dict = None,
     here (unlike simulate_team_period()'s "strict") since lineup_ceiling
     was built for trade grading, an asset-VALUE question, not a near-
     term production FORECAST; a player's current health status shouldn't
-    zero out their trade value. Pass "strict" explicitly for a forecast-
-    style use of this function instead (e.g. a future offseason-power-
-    rankings mode using last season's stats)."""
+    zero out their trade value. Only trade grading uses this function
+    now — compute_offseason_power_rankings() originally used this as a
+    schedule-independent stand-in for a real forecast, but was upgraded
+    (2026-09-17) to simulate_team_period() once real day-by-day schedule
+    data became available pre-season; a ~30-deep roster's ceiling only
+    ever credits the best 12, leaving real bench depth invisible to a
+    team-strength ranking specifically."""
     lookup = _build_player_lookup(roster, previous_player_stats, availability_filter=availability_filter)
     candidates = [
         (player_id, {pos.short_name for pos in player.all_positions}, value)
@@ -400,18 +510,44 @@ def lineup_ceiling(roster: list, previous_player_stats: dict = None,
 
 
 def simulate_team_period(api: FantraxAPI, team_id: str, period_number: int,
-                          previous_player_stats: dict = None) -> list:
+                          previous_player_stats: dict = None,
+                          availability_filter: str = "strict",
+                          manual_stat_overrides: dict = None) -> list:
     """Returns a list of that day's optimal-lineup total_fp, one entry
-    per date column in the period (empty list pre-season — see
-    fetch_team_period_data). previous_player_stats: optional {player_id:
-    {"fpts", "gp"}} — when given, blends each player's simulated value
-    toward their recent form; see _build_player_lookup(). Excludes Inj
-    Res roster-slot players and anyone currently out/injured_reserve/
-    suspended (NOT pure day-to-day — see _build_player_lookup()'s
-    "strict" tier) — presumably not playing regardless of whether their
-    NBA team has a game that day."""
+    per date column in whatever window SCHEDULE_FULL actually returns
+    (empty list pre-season, or before real per-date schedule data
+    exists — see fetch_team_period_data()). previous_player_stats:
+    optional {player_id: {"fpts", "gp"}} — when given, blends each
+    player's simulated value toward their recent form; see
+    _build_player_lookup().
+
+    availability_filter: see _build_player_lookup() — defaults to
+    "strict" (real near-term unavailability should count against a team
+    in a genuine production forecast; a fantasy manager's Inj Res SLOT
+    placement counts too, since here it's plausibly a real signal about
+    who's actually playing). compute_offseason_power_rankings() passes
+    "offseason" instead — same simulation mechanism, different
+    unavailability semantics (roster-slot placement alone shouldn't
+    zero a player out there — see that tier's docstring).
+
+    manual_stat_overrides: optional {player_name: fp_g} — see config.
+    manualStatOverrides' docstring. Applied the same way compute_
+    offseason_power_rankings() applied it directly to lineup_ceiling()
+    before this function took over that job: patches in the real fp_g
+    (and status, to bypass "strict"'s Inj Res gate if that ever matters
+    for an override candidate) for any gp==0 player whose name is in the
+    dict, before building the day's lineup candidates. Not used by the
+    real in-season compute_power_rankings() — that path always has a
+    real current-season fp_g source, nothing to override."""
     players, day_schedules = fetch_team_period_data(api, team_id, period_number=period_number)
-    player_lookup = _build_player_lookup(players, previous_player_stats, availability_filter="strict")
+    if manual_stat_overrides:
+        players = [
+            (p, manual_stat_overrides[p.name], fpts_total, gp, age, "Active")
+            if gp == 0 and p.name in manual_stat_overrides
+            else (p, fp_g, fpts_total, gp, age, status)
+            for p, fp_g, fpts_total, gp, age, status in players
+        ]
+    player_lookup = _build_player_lookup(players, previous_player_stats, availability_filter=availability_filter)
 
     day_totals = []
     for available_ids in day_schedules:
@@ -431,9 +567,10 @@ def compute_power_rankings(api: FantraxAPI, today=None, previous_player_stats: d
     """Returns [(team, total_points, total_days, points_per_day,
     roster_players), ...] for every team in the league, sorted descending
     by points_per_day (not raw total — normalizes away any difference in
-    how many days each staggered window happened to cover). Empty
-    per-team results (points_per_day=0.0) are expected, not an error,
-    until the season starts.
+    how many real games each team happens to have in the simulated
+    window, e.g. a team whose players' NBA teams play more games in that
+    stretch than another's). Empty per-team results (points_per_day=0.0)
+    are expected, not an error, until the season starts.
 
     previous_player_stats: optional {player_id: {"fpts", "gp"}} from
     last week's REAL post (see cogs/powerrankings.py's
@@ -468,21 +605,17 @@ def compute_power_rankings(api: FantraxAPI, today=None, previous_player_stats: d
     if today is None:
         today = datetime.date.today()
 
-    period_a, period_b = staggered_period_numbers(api, today)
-    periods = [p for p in (period_a, period_b) if p is not None]
-    if not periods:
+    period_number = _upcoming_period_number(api, today)
+    if period_number is None:
         return []
 
     results = []
     for team in api.teams:
-        total_points = 0.0
-        total_days = 0
-        for period_number in periods:
-            day_totals = simulate_team_period(
-                api, team.id, period_number, previous_player_stats=previous_player_stats
-            )
-            total_points += sum(day_totals)
-            total_days += len(day_totals)
+        day_totals = simulate_team_period(
+            api, team.id, period_number, previous_player_stats=previous_player_stats
+        )
+        total_points = sum(day_totals)
+        total_days = len(day_totals)
         per_day = total_points / total_days if total_days else 0.0
 
         roster = fetch_roster_players(api, team.id)
@@ -494,19 +627,28 @@ def compute_power_rankings(api: FantraxAPI, today=None, previous_player_stats: d
     return results
 
 
-def _build_roster_players_field(roster: list) -> list:
+def _build_roster_players_field(roster: list, exclude_inj_res_slot: bool = True) -> list:
     """roster: fetch_roster_players()-shaped list of (Player, fp_g,
     fpts_total, gp, age, status) tuples. Returns [(player_id, name, fp_g,
-    fpts_total, gp, age), ...] for every active-eligible player (Inj Res
-    excluded), sorted descending by fp_g — the roster_players field
-    shared by compute_power_rankings() and compute_offseason_power_
-    rankings(), so both feed narration/trend logic the exact same shape
-    regardless of which ranking mechanism produced the rest of the row."""
+    fpts_total, gp, age), ...] for every active-eligible player, sorted
+    descending by fp_g — the roster_players field shared by compute_
+    power_rankings() and compute_offseason_power_rankings(), so both
+    feed narration/trend logic the exact same shape regardless of which
+    ranking mechanism produced the rest of the row.
+
+    exclude_inj_res_slot: True (default, matches compute_power_rankings'
+    existing behavior) excludes players sitting on the fantasy roster's
+    Inj Res SLOT. compute_offseason_power_rankings() passes False — see
+    _build_player_lookup()'s "offseason" availability_filter docstring
+    for why that roster-slot placement isn't a reliable real-status
+    signal (a manager's roster-space choice, not necessarily reflecting
+    actual injury status) — keeps this field consistent with which
+    players actually count toward that ranking's ceiling."""
     active_eligible = sorted(
         (
             (p, fp_g, fpts_total, gp, age)
             for p, fp_g, fpts_total, gp, age, status in roster
-            if status != "Inj Res"
+            if not exclude_inj_res_slot or status != "Inj Res"
         ),
         key=lambda tup: tup[1],  # fp_g
         reverse=True,
@@ -522,59 +664,74 @@ def _build_roster_players_field(roster: list) -> list:
 # ranking mechanism (no live day-by-day simulation to lean on).
 # ─────────────────────────────────────────────────────────────────────────
 def compute_offseason_power_rankings(api: FantraxAPI, manual_stat_overrides: dict = None) -> list:
-    """Returns [(team, ceiling, 1, ceiling, roster_players), ...] for
-    every team, sorted descending by ceiling — the SAME tuple shape as
-    compute_power_rankings() (total_points, total_days, points_per_day),
-    so assign_tiers()/format_tier_list() work on it completely
-    unchanged with no special-casing. total_days is always 1 here since
-    there's no day-by-day simulation to sum across, just a single
-    current-roster snapshot — ceiling, total_points, and points_per_day
-    all end up the same number.
+    """Returns [(team, total_points, total_days, points_per_day,
+    roster_players), ...] for every team, sorted descending by
+    points_per_day — SAME tuple shape as compute_power_rankings(), and
+    (as of 2026-09-17) the SAME underlying mechanism: real day-by-day
+    simulation via simulate_team_period() against whatever window
+    SCHEDULE_FULL actually returns (see _upcoming_period_number()'s
+    module note — currently ~30 real days regardless of which single
+    period_number is requested). total_days now reflects that real day
+    count, not a fixed 1.
 
-    ceiling: lineup_ceiling(roster, availability_filter="strict") — the
-    team's CURRENT roster's optimal-lineup value, using each player's
-    PRIOR-SEASON per-game production (this is the offseason: the STATS
-    view already falls back to real last-season numbers, confirmed live
-    via tradegrades.py's validation — see CLAUDE.md). Positional depth/
-    logjam is accounted for automatically, same mechanism validated for
-    trade grading — a roster with 3 redundant PGs doesn't get credited
-    for all 3 the way a naive sum-of-fp_g ranking would.
+    UPGRADED from a lineup_ceiling() snapshot to this real simulation —
+    user's reasoning: rosters here run ~30 deep, and a lineup_ceiling()
+    snapshot only ever credits whichever 12 players could theoretically
+    fill the active slots if everyone had a game the same day, leaving
+    18+ real rostered players completely invisible to the ranking
+    regardless of how deep a team's bench actually is. The real
+    simulation naturally values that depth instead — on any given real
+    day, only players who actually have a game that day are even
+    eligible for a slot, so a team with real bench depth gets real
+    credit on nights its stars don't play, the same way the actual
+    in-season version has always worked. This was only possible once
+    real day-by-day schedule data became available pre-season (see the
+    "Real day-by-day schedule data now exists" section of CLAUDE.md) —
+    genuinely wasn't an option when this function was first built.
 
-    availability_filter="strict" (NOT lineup_ceiling's own "none"
-    default, which exists for trade grading/asset valuation) — this IS a
-    forecast-style use (ranking team STRENGTH, not a single player's
-    trade worth), so real near-term unavailability should still count
-    against a team, matching the real in-season simulation's semantics.
-    Does NOT blend recent form (no previous_player_stats passed) — there
-    is no meaningful 'recent' signal when no games are being played.
+    availability_filter="offseason" (passed to simulate_team_period(),
+    NOT its own "strict" default) — excludes real out/injured_reserve/
+    suspended status but NOT a player sitting on their fantasy team's
+    Inj Res roster SLOT. Confirmed live this matters: that slot is a
+    manager's roster-space choice (frees up an Active/Reserve spot),
+    NOT reliably a real injury signal — found a real case (a player with
+    Player.injured_reserve == False, Fantrax's own data saying he's not
+    actually hurt, zeroed out purely because his manager parked him on
+    Inj Res). "strict" is right for the real in-season forecast (near-
+    term unavailability should count there); this ranking is about
+    actual real-world status heading into next season, which the roster
+    slot doesn't reliably tell you. Still does NOT blend recent form (no
+    previous_player_stats passed) — no meaningful 'recent' signal when
+    real games for the CURRENT season haven't started yet.
 
     manual_stat_overrides: optional {player_name: fp_g} — see config.
-    manualStatOverrides' docstring for the full reasoning (confirmed live
-    that Fantrax's prior-season selector isn't reachable through this
-    API, so there's no programmatic way to get a real fp_g for a proven
-    player who shows 0 games this season). Applied ONLY when a player's
-    gp == 0 exactly — any real games this season take priority
-    automatically, so a stale override entry can't silently shadow real
-    production. Not meant for rookies/prospects (no real number to
-    override with in the first place, replacement-level is the honest
-    default there) — this is for a small, human-curated list of known,
-    established players the API can't currently value correctly.
+    manualStatOverrides' docstring for the full reasoning. Passed
+    straight through to simulate_team_period(), which now owns applying
+    it (patches fp_g + status for any gp==0 player whose name is in the
+    dict) — same effective behavior as when this function patched the
+    roster itself before calling lineup_ceiling() directly. Still
+    separately re-applied to the roster fetched for roster_players below
+    — that's a SEPARATE fetch_roster_players() call for narration/debug-
+    dump display purposes, not part of the simulation itself, so it
+    needs its own patch to stay visually consistent with what the
+    simulation actually counted."""
+    import datetime
+    today = datetime.date.today()
+    period_number = _upcoming_period_number(api, today)
+    if period_number is None:
+        return []
 
-    Also patches status to "Active" for an overridden player — confirmed
-    live that Lillard/Irving are gated by their fantasy roster's OWN
-    "Inj Res" SLOT status (a separate, manager-set exclusion from
-    Fantrax's per-player injury icons), which would otherwise silently
-    zero them right back out even with a real fp_g patched in. Confirmed
-    none of the real override candidates (Lillard, Irving, Haliburton,
-    VanVleet) have Player.out/injured_reserve/suspended set — those are
-    Fantrax's own icon-based flags, a DIFFERENT gate this patch does NOT
-    bypass, since mutating the real Player object's own properties isn't
-    possible from here. Not currently a real-world gap (none of the
-    actual candidates hit it), but worth knowing if a future override
-    candidate ever does."""
     overrides = manual_stat_overrides or {}
     results = []
     for team in api.teams:
+        day_totals = simulate_team_period(
+            api, team.id, period_number,
+            availability_filter="offseason", manual_stat_overrides=overrides,
+        )
+        total_points = sum(day_totals)
+        total_days = len(day_totals)
+        per_day = total_points / total_days if total_days else 0.0
+
         roster = fetch_roster_players(api, team.id)
         if overrides:
             roster = [
@@ -582,9 +739,9 @@ def compute_offseason_power_rankings(api: FantraxAPI, manual_stat_overrides: dic
                 else (p, fp_g, fpts_total, gp, age, status)
                 for p, fp_g, fpts_total, gp, age, status in roster
             ]
-        ceiling = lineup_ceiling(roster, availability_filter="strict")
-        roster_players = _build_roster_players_field(roster)
-        results.append((team, ceiling, 1, ceiling, roster_players))
+        roster_players = _build_roster_players_field(roster, exclude_inj_res_slot=False)
+
+        results.append((team, total_points, total_days, per_day, roster_players))
     results.sort(key=lambda r: r[3], reverse=True)
     return results
 
@@ -601,7 +758,7 @@ def compute_offseason_power_rankings(api: FantraxAPI, manual_stat_overrides: dic
 # actually is (changes season to season) rather than being a fixed joke
 # baked into the code. This default is only used by standalone callers
 # (tests, direct script use) that don't go through the cog.
-TIER_NAMES = ("👑 Favorites", "🏆 Contenders", "⚔️ In the Hunt", "🥞 Pancake Contention")
+TIER_NAMES = ("👑 Favorites", "🏆 Contenders", "🎲 Long Shots", "🥞 Pancake Contention")
 
 
 def assign_tiers(rankings: list, tier_names: tuple = None) -> list:
@@ -887,6 +1044,110 @@ def generate_power_rankings_writeup(rankings: list, api_key: str, records: dict 
     return next((b.text for b in response.content if b.type == "text"), "")
 
 
+def compute_offseason_movers(rankings: list, previous_player_values: dict,
+                              previous_ranks: dict = None, n: int = 3) -> dict:
+    """rankings: compute_offseason_power_rankings()'s output.
+    previous_player_values: {player_id: {"name": str, "fp_g": float,
+    "team_id": str}} from the last REAL offseason post (see
+    cogs/offseasonpowerrankings.py's _load_previous_player_values(); {}
+    or None if there's no prior snapshot).
+    previous_ranks: optional {team_id: last_rank} — used to pick which
+    teams get detailed "why" treatment: the n teams with the largest
+    |current_rank - previous_rank|. Without it, every team with a real
+    driver is reported (used by /offseasonrankingsdebug-style previews
+    that don't have real rank history to compare against).
+
+    WHY this exists: confirmed live that a real rank swing can happen
+    with ZERO actual roster moves — Fantrax's own "Projected - Season"
+    values shift on their own (real-world injury news, its own
+    recalculation), not just when a trade/waiver move happens. Handing
+    the narration a bare rank delta risks it inventing a plausible-
+    sounding but FALSE "why" (implying a trade that never happened) —
+    this computes the real, distinguishable cause instead, so the
+    narration only ever states something actually true.
+
+    Returns {team_id: {"gained": [(name, source)], "lost": [(name,
+    destination)], "shifted": [(name, direction)]}} for only the
+    biggest-moving teams:
+    - "gained": players newly on this roster since the last snapshot.
+      source is "from <old team name>" if they were tracked on a
+      DIFFERENT team_id last snapshot (a real trade/waiver move), or
+      "new addition" if they weren't in previous_player_values at all
+      (a free agent nobody had rostered before).
+    - "lost": players who were on this roster last snapshot but aren't
+      now. destination is "to <new team name>" if they're findable on
+      another team's CURRENT roster, or "dropped" if they're not on any
+      tracked roster right now.
+    - "shifted": players who stayed on THIS roster both snapshots, but
+      whose value changed — NOT a roster move, a value/projection
+      change. Capped at the top 2 by |delta| per team; small/negligible
+      shifts (<1.0 fp_g) are dropped as noise, not a real signal."""
+    if not previous_player_values:
+        return {}
+
+    team_name_by_id = {team.id: team.name for team, *_rest in rankings}
+
+    previous_by_team = {}
+    for player_id, info in previous_player_values.items():
+        previous_by_team.setdefault(info["team_id"], set()).add(player_id)
+
+    current_owner_by_id = {}  # player_id -> team_id, across the WHOLE league right now
+    current_roster_by_team = {}  # team_id -> {player_id: (name, fp_g)}
+    for team, _total, _days, _per_day, roster_players in rankings:
+        current_roster_by_team[team.id] = {}
+        for player_id, name, fp_g, *_rest in roster_players:
+            current_owner_by_id[player_id] = team.id
+            current_roster_by_team[team.id][player_id] = (name, fp_g)
+
+    if previous_ranks:
+        current_ranks = {team.id: rank for rank, (team, *_rest) in enumerate(rankings, start=1)}
+        deltas = sorted(
+            (
+                (abs(current_ranks[tid] - prev_rank), tid)
+                for tid, prev_rank in previous_ranks.items()
+                if tid in current_ranks
+            ),
+            reverse=True,
+        )
+        big_mover_ids = {tid for delta, tid in deltas[:n] if delta > 0}
+    else:
+        big_mover_ids = None  # report every team with a real driver
+
+    results = {}
+    for team_id, current_roster in current_roster_by_team.items():
+        if big_mover_ids is not None and team_id not in big_mover_ids:
+            continue
+
+        gained, shifted = [], []
+        for player_id, (name, fp_g) in current_roster.items():
+            prev = previous_player_values.get(player_id)
+            if prev is None:
+                gained.append((name, "new addition"))
+            elif prev["team_id"] != team_id:
+                gained.append((name, f"from {team_name_by_id.get(prev['team_id'], 'a waiver pickup')}"))
+            else:
+                delta = fp_g - prev["fp_g"]
+                if abs(delta) >= 1.0:
+                    shifted.append((name, delta))
+
+        lost = []
+        for player_id in previous_by_team.get(team_id, set()) - current_roster.keys():
+            name = previous_player_values[player_id]["name"]
+            new_owner = current_owner_by_id.get(player_id)
+            destination = f"to {team_name_by_id.get(new_owner, 'elsewhere')}" if new_owner else "dropped"
+            lost.append((name, destination))
+
+        shifted.sort(key=lambda x: -abs(x[1]))
+
+        if gained or lost or shifted:
+            results[team_id] = {
+                "gained": gained[:3],
+                "lost": lost[:3],
+                "shifted": [(name, "up" if delta > 0 else "down") for name, delta in shifted[:2]],
+            }
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # OFFSEASON NARRATION — separate system prompt rather than branching the
 # real one: the framing genuinely differs (no live games, so "movement"
@@ -899,26 +1160,38 @@ sports-insider posts for a 10-team fantasy basketball dynasty league — the sam
 its trade/transaction breaking-news posts (Woj/Shams style: punchy, no hedging, no disclaimers).
 
 This is an OFFSEASON power rankings post — there are no NBA games being played right now, so \
-this is NOT a live simulation like the in-season version. It ranks each team's CURRENT roster \
-strength using every player's PRIOR-SEASON per-game production, computed against the real \
-12-slot active-lineup structure (so positional depth/logjam is already accounted for correctly \
-— a roster with three redundant players at one position doesn't get credited for all three the \
-way a naive sum of raw production would). Already computed and already correct, NOT something \
-you compute yourself. A separate, code-generated tier-grouped list of every team's rank is \
-already posted above whatever you write; your ONLY job is to write ONE short paragraph \
-highlighting the most notable storylines across the WHOLE LEAGUE — biggest riser(s)/faller(s), \
-any team new to the rankings. This is a league-wide summary, not a team-by-team breakdown — you \
-do not need to mention every team, only what's genuinely notable.
+this is NOT a live simulation of the CURRENT season's results like the in-season version. It \
+ranks each team's roster strength via a real day-by-day simulation against actual NBA schedule \
+data for the upcoming season, using each player's current per-game value (last season's real \
+stats or Fantrax's own preseason projections, whichever is currently available — not something \
+you need to track). Positional depth and real bench depth are already accounted for correctly. \
+Already computed and already correct, NOT something you compute yourself. A separate, code-\
+generated tier-grouped list of every team's rank is already posted above whatever you write; \
+your ONLY job is to write ONE short paragraph highlighting the most notable storylines across \
+the WHOLE LEAGUE — biggest riser(s)/faller(s), any team new to the rankings. This is a league-\
+wide summary, not a team-by-team breakdown — you do not need to mention every team, only what's \
+genuinely notable.
 
-Since there are no games happening, movement since the last check-in reflects REAL ROSTER \
-CHANGES — trades, waiver pickups/drops — not a hot or cold streak. Frame it that way (e.g. "a \
-notably stronger roster since the last check-in" rather than anything implying recent game \
-performance, win streaks, or hot shooting).
+Since there are no games happening, movement since the last check-in is NEVER a hot or cold \
+streak — but it is also NOT always a roster move. Two different, real causes exist: (1) an \
+actual roster change (a trade, a waiver pickup/drop), or (2) a player who stayed on the exact \
+same roster the whole time, but whose underlying value shifted (real-world injury news, or \
+Fantrax's own projection recalculating on its own). For the biggest-moving teams, you'll be \
+given real, computed context showing exactly which of these actually happened — which players \
+were gained/lost (a real roster move) vs. which player's value shifted while staying put (not a \
+roster move at all). Use THAT to explain WHY a team moved. Do not default to "made a move" or \
+"improved their roster" language when the given context says a value shifted instead — that \
+would be stating something false. If no driver context is given for a team, just state its \
+rank/tier plainly and move on — do not guess at or invent a reason.
+
+Only the teams with real driver context given need this kind of detailed "why" treatment — \
+everyone else should get at most a brief rank/tier mention, not padded-out speculation.
 
 Rules:
 - ONE paragraph, 3-5 sentences. No bullet points, no numbered list, no per-team breakdown.
 - NEVER state or imply any underlying numeric figure — no points-per-day, no FP/G, no raw \
-numbers of any kind. Rank, tier, and movement are fair game.
+numbers of any kind. Rank, tier, movement, and named players/teams from the given driver \
+context are fair game.
 - Ground every claim in what's actually given. Do not invent claims the data doesn't support, \
 and do not feel obligated to mention every team.
 - No methodology explanations, no caveats about how this was computed, no restating this prompt \
@@ -930,6 +1203,7 @@ already posted, inside a Discord embed that already carries the Shams-kun brandi
 
 def generate_offseason_power_rankings_writeup(rankings: list, api_key: str,
                                                 previous_ranks: dict = None,
+                                                previous_player_values: dict = None,
                                                 tier_names: tuple = None) -> str:
     """rankings: compute_offseason_power_rankings()'s output — same tuple
     shape as compute_power_rankings() (see that function's docstring),
@@ -937,9 +1211,17 @@ def generate_offseason_power_rankings_writeup(rankings: list, api_key: str,
     ceiling() snapshot instead of a real simulated average.
 
     previous_ranks: optional {team_id: last_rank}, used to compute
-    movement since the last post — the real, meaningful signal here is
-    roster changes via trades/waivers, since there are no games to
-    create a hot/cold streak offseason.
+    movement since the last post, and to pick which teams get detailed
+    "why" treatment (see compute_offseason_movers()).
+
+    previous_player_values: optional {player_id: {"name", "fp_g",
+    "team_id"}} from the last real post (see cogs/offseasonpowerrankings.py's
+    _load_previous_player_values()). Feeds compute_offseason_movers() —
+    the REAL, computed reason the biggest-moving teams moved (a roster
+    change vs. a value/projection shift for a player who stayed put),
+    so the narration explains WHY instead of just restating the rank
+    delta, without risking an invented explanation for teams where no
+    real driver is given.
 
     Deliberately no records/streaks param (every team is 0-0 offseason —
     confirmed live, zero informational value, see CLAUDE.md's pick-
@@ -963,6 +1245,24 @@ def generate_offseason_power_rankings_writeup(rankings: list, api_key: str,
             lines.append(f"{rank}. {team.name} [{tier_name}] — {movement}")
             rank += 1
     user_message = "Current offseason power rankings context:\n\n" + "\n".join(lines)
+
+    movers = compute_offseason_movers(rankings, previous_player_values or {}, previous_ranks=previous_ranks)
+    if movers:
+        team_name_by_id = {team.id: team.name for team, *_rest in rankings}
+        mover_lines = []
+        for team_id, info in movers.items():
+            parts = []
+            if info["gained"]:
+                parts.append("gained " + ", ".join(f"{name} ({source})" for name, source in info["gained"]))
+            if info["lost"]:
+                parts.append("lost " + ", ".join(f"{name} ({dest})" for name, dest in info["lost"]))
+            if info["shifted"]:
+                parts.append("saw " + ", ".join(f"{name} trend {direction}" for name, direction in info["shifted"]))
+            mover_lines.append(f"- {team_name_by_id.get(team_id, '?')}: {'; '.join(parts)}")
+        user_message += (
+            "\n\nWhat's actually driving the biggest movers (use this to explain WHY, not just that "
+            "they moved):\n" + "\n".join(mover_lines)
+        )
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
